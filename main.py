@@ -45,6 +45,7 @@ from modules.notifier import TelegramNotifier
 from modules.categories import (
     classify_result, extract_belakang, parse_result_full, result_summary,
 )
+from modules.telegram_commands import TelegramCommands
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
@@ -82,6 +83,7 @@ class HokidrawBot:
         self.bettor        = Bettor(self.auth)
         self.mm            = MoneyManager()
         self.notifier      = TelegramNotifier()
+        self.tg_commands   = TelegramCommands(self.auth, self.mm)
         self._last_period: Optional[str] = None
 
     # ─── Siklus utama ─────────────────────────────────────────────────────────
@@ -89,6 +91,12 @@ class HokidrawBot:
     async def hourly_cycle(self) -> None:
         now = _now_wib()
         logger.info("=== Siklus mulai @ %s ===", now.strftime("%H:%M WIB"))
+
+        # 0. Cek pause
+        if self.tg_commands.is_paused:
+            logger.info("Bot di-PAUSE via Telegram — skip siklus ini")
+            await self.notifier.notify_alert("Siklus di-skip karena bot sedang PAUSE")
+            return
 
         # 1. Pastikan login aktif
         if not await self.auth.ensure_logged_in():
@@ -182,6 +190,7 @@ class HokidrawBot:
                               bk_level, gj_level, bk_resp, gj_resp)
 
         self._last_period = periode
+        await db.set_state("last_period", periode)
 
         # 11. Notifikasi
         actual_bk_amount = bk_amount if bk_resp else 0
@@ -392,9 +401,20 @@ class HokidrawBot:
             sys.exit(1)
         balance = await self.auth.get_balance()
         logger.info("Login OK. Balance: Rp%s", f"{balance:,}" if balance else "?")
+
+        # Restore last_period dari DB agar tidak bet duplikat setelah restart
+        saved_period = await db.get_state("last_period")
+        if saved_period:
+            self._last_period = saved_period
+            logger.info("Restored last_period dari DB: %s", saved_period)
+
         await self.notifier.send_startup(dry_run=self.dry_run)
 
+        # Start Telegram command listener
+        await self.tg_commands.start()
+
     async def shutdown(self) -> None:
+        await self.tg_commands.stop()
         await self.notifier.send_shutdown()
         await self.auth.close()
 

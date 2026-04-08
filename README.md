@@ -69,8 +69,10 @@ Outcome (BK dan GJ independen, masing-masing 50% win rate):
 - **5 Level Martingale** — Rp100 → Rp200 → Rp400 → Rp800 → Rp1.600/angka
 - **Daily Loss Limit** — bot pause otomatis jika rugi harian melebihi batas, resume besok
 - **Notifikasi Telegram** — setiap bet, hasil menang/kalah, dan summary harian 23:55 WIB
+- **Telegram Commands** — kontrol bot via Telegram: cek status, balance, riwayat, profit, pause/resume
 - **Cloudflare Bypass** — httpx dengan browser headers; Playwright headless Chromium sebagai fallback
 - **Dry-run Mode** — simulasi penuh tanpa bet sungguhan
+- **Persistent State** — semua state (martingale level, last period, daily loss) tersimpan di DB, aman restart
 - **Domain Fleksibel** — ganti `SITE_URL` di `.env` jika domain berubah, tanpa ubah kode
 
 ---
@@ -92,7 +94,8 @@ barbatos/
 │   ├── predictor.py         # Kirim history ke LLM → prediksi BK + GJ
 │   ├── bettor.py            # POST /games/4d/send dengan 50 angka, cek menang
 │   ├── money_manager.py     # Soft martingale terpisah BK/GJ + daily loss limit
-│   ├── notifier.py          # Notifikasi Telegram
+│   ├── notifier.py          # Notifikasi Telegram (outgoing)
+│   ├── telegram_commands.py # Telegram command handler (incoming): /status, /balance, dll
 │   └── database.py          # SQLite: results, bets, daily_stats, bot_state
 ├── data/                    # SQLite DB — dibuat otomatis saat runtime
 └── logs/                    # Log file — dibuat otomatis saat runtime
@@ -194,6 +197,23 @@ nano /opt/hokidraw-bot/.env
 
 > **Cara dapat CHAT_ID:** Kirim pesan ke bot Anda → buka
 > `https://api.telegram.org/bot<TOKEN>/getUpdates` → cari `"chat":{"id": ...}`
+
+### Telegram Commands
+
+Bot mendukung perintah interaktif via Telegram. Ketik `/` di chat untuk melihat menu.
+
+| Command | Fungsi |
+|---|---|
+| `/status` | Status bot: mode, balance, level martingale, daily loss |
+| `/balance` | Cek saldo akun saat ini |
+| `/history` | 10 bet terakhir (pilihan, amount, menang/kalah) |
+| `/results` | 10 hasil draw terakhir dari database |
+| `/stats` | Statistik hari ini: total bet, win rate, profit |
+| `/profit` | Profit hari ini & keseluruhan + balance |
+| `/level` | Detail level martingale BK & GJ |
+| `/pause` | Pause bot — skip siklus sampai di-resume |
+| `/resume` | Resume bot setelah pause |
+| `/help` | Daftar semua perintah |
 
 ### LLM
 
@@ -297,7 +317,7 @@ Semua data disimpan di `data/hokidraw.db`:
 | `results` | Setiap draw: 4D lengkap, depan/tengah/belakang, `belakang_bk`, `belakang_gj` |
 | `bets` | **1 row per dimensi** — kolom: `bet_dimension`, `bet_choice`, `bet_amount_per_angka`, `confidence`, `status`, `win_amount`, `result_match` |
 | `daily_stats` | Per tanggal: total bet, total win, profit/loss, saldo akhir |
-| `bot_state` | State persisten: `consecutive_losses_bk`, `consecutive_losses_gj`, `martingale_level_bk`, `martingale_level_gj`, `daily_loss` |
+| `bot_state` | State persisten: `consecutive_losses_bk`, `consecutive_losses_gj`, `martingale_level_bk`, `martingale_level_gj`, `daily_loss`, `last_period`, `bot_paused` |
 
 ---
 

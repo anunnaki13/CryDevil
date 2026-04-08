@@ -152,7 +152,13 @@ class AuthManager:
                 headers=AJAX_HEADERS,
             )
             data = resp.json()
-            raw = data.get("balance") or data.get("saldo") or data.get("data", {}).get("balance")
+            # API may return a bare number (float/int) instead of a dict
+            if isinstance(data, (int, float)):
+                return int(data)
+            if isinstance(data, dict):
+                raw = data.get("balance") or data.get("saldo") or data.get("data", {}).get("balance")
+            else:
+                raw = data
             if raw is not None:
                 # Strip non-numeric chars and convert
                 clean = str(raw).replace(".", "").replace(",", "").replace("Rp", "").strip()

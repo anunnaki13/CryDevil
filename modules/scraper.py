@@ -67,7 +67,7 @@ class Scraper:
     # ─── Current period ───────────────────────────────────────────────────────
 
     async def get_current_periode(self) -> Optional[str]:
-        """Parse current betting periode from game page."""
+        """Parse current betting periode from game page or derive from history."""
         client = await self._client()
         try:
             resp = await client.get(
@@ -77,49 +77,82 @@ class Scraper:
             soup = BeautifulSoup(resp.text, "lxml")
             # Hidden field named 'periode'
             tag = soup.find("input", {"name": "periode"}) or soup.find(attrs={"name": "periode"})
-            if tag:
+            if tag and tag.get("value", "").strip():
                 return tag.get("value", "").strip()
             # Fallback: find in text
             match = re.search(r"periode[\"'\s:]+([A-Z0-9\-]+)", resp.text)
             if match:
                 return match.group(1)
         except Exception as e:
-            logger.error("Period fetch failed: %s", e)
+            logger.error("Period fetch from game page failed: %s", e)
+
+        # Fallback: derive next periode from latest history entry
+        try:
+            history = await self.get_draw_history(limit=1)
+            if history:
+                last_period = history[0]["periode"]
+                # Periode is numeric and increments by 1
+                next_period = str(int(last_period) + 1)
+                logger.info("Derived current periode from history: %s (last=%s)", next_period, last_period)
+                return next_period
+        except Exception as e:
+            logger.error("Period derivation from history failed: %s", e)
         return None
 
     # ─── Draw history ─────────────────────────────────────────────────────────
 
-    async def get_draw_history(self) -> list[dict]:
+    async def get_draw_history(self, limit: int = 200) -> list[dict]:
         """Fetch draw history (JSON endpoint with HTML table fallback)."""
-        results = await self._fetch_history_json()
+        results = await self._fetch_history_json(limit=limit)
         if not results:
             results = await self._fetch_history_html()
         return results
 
-    async def _fetch_history_json(self) -> list[dict]:
+    async def _fetch_history_json(self, limit: int = 200) -> list[dict]:
         client = await self._client()
-        try:
-            resp = await client.get(
-                f"{BASE_URL}/history/detail/data/{POOL_ID}-1",
-                headers=AJAX_HEADERS,
-            )
-            data = resp.json()
-            # Normalise varying response structures
-            rows = (
-                data if isinstance(data, list)
-                else data.get("data", data.get("results", data.get("history", [])))
-            )
-            parsed = []
-            for row in rows:
-                periode = str(row.get("periode", row.get("period", row.get("id", ""))))
-                result = str(row.get("result", row.get("keluaran", row.get("number", ""))))
-                draw_time = str(row.get("draw_time", row.get("time", row.get("tanggal", ""))))
-                if periode and result:
-                    parsed.append({"periode": periode, "result": result, "draw_time": draw_time})
-            return parsed
-        except Exception as e:
-            logger.debug("JSON history fetch failed: %s", e)
-        return []
+        parsed = []
+        per_page = 10
+        pages_needed = min((limit + per_page - 1) // per_page, 30)  # cap at 30 pages
+
+        for page in range(1, pages_needed + 1):
+            try:
+                resp = await client.get(
+                    f"{BASE_URL}/history/detail/data/{POOL_ID}-{page}",
+                    headers=AJAX_HEADERS,
+                )
+                data = resp.json()
+
+                # API returns {angka_keluar: {data: [...]}} or flat list/dict
+                if isinstance(data, dict) and "angka_keluar" in data:
+                    rows = data["angka_keluar"].get("data", [])
+                elif isinstance(data, list):
+                    rows = data
+                else:
+                    rows = data.get("data", data.get("results", data.get("history", [])))
+
+                if not rows:
+                    break
+
+                for row in rows:
+                    periode = str(row.get("periode", row.get("period", row.get("id", ""))))
+                    # API uses "angka" for the 4D result
+                    result = str(
+                        row.get("angka", row.get("result", row.get("keluaran", row.get("number", ""))))
+                    )
+                    draw_time = str(
+                        row.get("jam", row.get("draw_time", row.get("time", row.get("tanggal", ""))))
+                    )
+                    if periode and result:
+                        parsed.append({"periode": periode, "result": result, "draw_time": draw_time})
+
+                if len(parsed) >= limit:
+                    break
+
+            except Exception as e:
+                logger.debug("JSON history page %d failed: %s", page, e)
+                break
+
+        return parsed[:limit]
 
     async def _fetch_history_html(self) -> list[dict]:
         client = await self._client()
@@ -148,8 +181,14 @@ class Scraper:
 
     async def get_latest_result(self) -> Optional[dict]:
         """Return the most recent draw result dict {periode, result, draw_time}."""
-        history = await self.get_draw_history()
-        return history[0] if history else None
+        history = await self.get_draw_history(limit=1)
+        if not history:
+            return None
+        item = history[0]
+        # Ensure both 'period' and 'periode' keys exist for compatibility
+        item.setdefault("period", item.get("periode", ""))
+        item.setdefault("periode", item.get("period", ""))
+        return item
 
     # ─── Bet history ──────────────────────────────────────────────────────────
 
