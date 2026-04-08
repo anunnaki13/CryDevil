@@ -85,8 +85,16 @@ class AuthManager:
                 headers={**AJAX_HEADERS, "Referer": BASE_URL + "/"},
             )
             data = resp.json()
-            if data.get("status") in (1, "1", True, "true", "ok", "success"):
-                logger.info("Login successful")
+            # Site returns {"message":"redirect_index","status_code":"0"} on success
+            msg = data.get("message", "")
+            sc = str(data.get("status_code", data.get("status", "")))
+            is_ok = (
+                msg in ("redirect_index", "ok", "success")
+                or sc in ("1", "true", "ok", "success")
+                or data.get("status") in (1, "1", True, "true", "ok", "success")
+            )
+            if is_ok:
+                logger.info("Login successful (msg=%s, status_code=%s)", msg, sc)
                 self._last_validated = time.monotonic()
                 return True
             logger.error("Login rejected: %s", data)
@@ -112,7 +120,13 @@ class AuthManager:
                 headers=AJAX_HEADERS,
             )
             data = resp.json()
-            valid = data.get("status") in (1, "1", True, "true", "ok", "success")
+            msg = data.get("message", "")
+            sc = str(data.get("status_code", data.get("status", "")))
+            valid = (
+                msg in ("redirect_index", "ok", "success", "logged_in")
+                or sc in ("1", "true", "ok", "success")
+                or data.get("status") in (1, "1", True, "true", "ok", "success")
+            )
             if valid:
                 self._last_validated = time.monotonic()
             return valid
