@@ -1,4 +1,4 @@
-"""LLM-based number predictor using OpenRouter API."""
+"""LLM predictor via OpenRouter — prediksi BE/KE dan GE/GA untuk 2D Belakang."""
 
 import json
 import logging
@@ -11,39 +11,56 @@ from config import (
     OPENROUTER_API_KEY, OPENROUTER_BASE_URL,
     LLM_PRIMARY, LLM_FALLBACK,
     LLM_TEMPERATURE, LLM_MAX_TOKENS,
-    NUM_PICKS,
+    HISTORY_WINDOW,
 )
+from modules.categories import classify_result, CHOICE_LABELS
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = """You are a data analyst specializing in lottery pattern analysis.
-Analyze the provided 2D lottery draw history and identify the most likely numbers for the next draw.
-Base your analysis on statistical patterns only — not superstition.
+# ─── Prompt template (sesuai blueprint) ──────────────────────────────────────
 
-Respond ONLY with valid JSON in this exact format:
-{
-  "picks": [
-    {"number": "XX", "confidence": 0.0-1.0, "reason": "brief reason"},
-    ...
-  ],
-  "analysis": "brief overall analysis summary (max 3 sentences)"
-}
+_PROMPT_TEMPLATE = """Kamu adalah analis statistik togel. Analisis data 2D Belakang berikut
+dan rekomendasikan taruhan untuk periode berikutnya.
 
-Rules:
-- Provide exactly """ + str(NUM_PICKS) + """ picks
-- Numbers must be 2-digit strings from "00" to "99"
-- No duplicate numbers
-- Confidence between 0.01 and 0.99
-- Keep reasons concise (under 15 words each)
-"""
+Data {n} periode terakhir pasaran Hokidraw (2D Belakang):
+{history_table}
 
-_USER_PROMPT_TEMPLATE = """Here are the last {count} draw results for the Hokidraw 2D lottery market
-(most recent first, format: periode | result):
+Kolom data: Periode | 2D Belakang | Besar/Kecil | Genap/Ganjil
 
-{history}
+Analisis yang harus dilakukan:
+1. Hitung frekuensi BESAR vs KECIL dari {n} periode terakhir
+2. Hitung frekuensi GENAP vs GANJIL dari {n} periode terakhir
+3. Analisis streak/pola terakhir (apakah ada pola berturut-turut?)
+4. Analisis 10 dan 20 periode terakhir (trend terkini)
+5. Identifikasi apakah ada bias signifikan
 
-Based on these results, predict the top {num_picks} most likely 2D numbers for the next draw.
-Consider: hot numbers, cold/overdue numbers, digit frequency, consecutive patterns, and recent trends."""
+ATURAN KLASIFIKASI:
+- BESAR (BE) = angka 50-99 (digit pertama 5-9)
+- KECIL (KE) = angka 00-49 (digit pertama 0-4)
+- GENAP (GE) = digit terakhir 0,2,4,6,8
+- GANJIL (GA) = digit terakhir 1,3,5,7,9
+
+Respond HANYA dalam format JSON berikut, tanpa teks lain:
+{{
+  "besar_kecil": {{
+    "choice": "BE" atau "KE",
+    "confidence": 0.XX,
+    "reason": "penjelasan singkat"
+  }},
+  "genap_ganjil": {{
+    "choice": "GE" atau "GA",
+    "confidence": 0.XX,
+    "reason": "penjelasan singkat"
+  }},
+  "stats": {{
+    "besar_count": N,
+    "kecil_count": N,
+    "genap_count": N,
+    "ganjil_count": N,
+    "last_10_bk": "BBKBKKBKBB",
+    "last_10_gj": "GGJGGGJGGG"
+  }}
+}}"""
 
 
 class Predictor:
@@ -53,101 +70,131 @@ class Predictor:
             base_url=OPENROUTER_BASE_URL,
         )
 
-    async def predict(self, history: list[dict]) -> Optional[dict]:
+    async def analyze(self, history: list[dict]) -> Optional[dict]:
         """
-        Predict next draw numbers from history.
+        Analisis history dan prediksi BE/KE + GE/GA untuk draw berikutnya.
 
         Args:
-            history: list of dicts with 'periode' and 'result' keys, most recent first.
+            history: list dict dari DB (kolom: period, number_2d_belakang, belakang_bk, belakang_gj)
+                     atau dari scraper (kolom: periode/period, result)
+                     Terbaru pertama.
 
         Returns:
-            dict with 'picks' (list of {number, confidence, reason}) and 'analysis'.
+            {
+                "besar_kecil":  {"choice": "BE"|"KE", "confidence": float, "reason": str},
+                "genap_ganjil": {"choice": "GE"|"GA", "confidence": float, "reason": str},
+                "stats": {...}
+            }
+            atau None jika gagal.
         """
         if not history:
-            logger.warning("No history provided for prediction")
+            logger.warning("History kosong")
             return None
 
-        history_text = "\n".join(
-            f"{h['periode']} | {h['result']}" for h in history[:200]
-        )
-        user_prompt = _USER_PROMPT_TEMPLATE.format(
-            count=len(history[:200]),
-            history=history_text,
-            num_picks=NUM_PICKS,
-        )
+        history_table = self._build_table(history[:HISTORY_WINDOW])
+        n = len(history[:HISTORY_WINDOW])
 
-        result = await self._call_llm(LLM_PRIMARY, user_prompt)
+        prompt = _PROMPT_TEMPLATE.format(n=n, history_table=history_table)
+
+        result = await self._call_llm(LLM_PRIMARY, prompt)
         if result is None:
-            logger.warning("Primary model failed, trying fallback")
-            result = await self._call_llm(LLM_FALLBACK, user_prompt)
+            logger.warning("Model utama gagal, coba fallback")
+            result = await self._call_llm(LLM_FALLBACK, prompt)
 
         return result
 
-    async def _call_llm(self, model: str, user_prompt: str) -> Optional[dict]:
+    # ─── Build table ──────────────────────────────────────────────────────────
+
+    def _build_table(self, history: list[dict]) -> str:
+        rows = []
+        for h in history:
+            # Support dua format: dari DB (number_2d_belakang) atau scraper (result)
+            period = h.get("period") or h.get("periode") or "?"
+
+            if "number_2d_belakang" in h:
+                belakang = h["number_2d_belakang"]
+                bk = h.get("belakang_bk", "?")
+                gj = h.get("belakang_gj", "?")
+                bk_label = CHOICE_LABELS.get(bk, bk)
+                gj_label = CHOICE_LABELS.get(gj, gj)
+            else:
+                # Format dari scraper: result = "1295" (4 digit)
+                result_raw = str(h.get("result", "")).strip()
+                import re as _re
+                digits = _re.sub(r"\D", "", result_raw)
+                if len(digits) >= 4:
+                    belakang = digits[-2:]
+                    cat = classify_result(belakang)
+                    bk_label = cat["besar_kecil_label"]
+                    gj_label = cat["genap_ganjil_label"]
+                else:
+                    belakang = result_raw[-2:] if len(result_raw) >= 2 else "??"
+                    bk_label = "?"
+                    gj_label = "?"
+
+            rows.append(f"{period} | {belakang} | {bk_label} | {gj_label}")
+
+        return "\n".join(rows)
+
+    # ─── LLM call ─────────────────────────────────────────────────────────────
+
+    async def _call_llm(self, model: str, prompt: str) -> Optional[dict]:
         try:
             response = await self._client.chat.completions.create(
                 model=model,
-                messages=[
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
+                messages=[{"role": "user", "content": prompt}],
                 temperature=LLM_TEMPERATURE,
                 max_tokens=LLM_MAX_TOKENS,
             )
             content = response.choices[0].message.content
-            logger.debug("LLM raw response (%s): %s", model, content)
+            logger.debug("LLM raw (%s): %s", model, content[:300])
             return self._parse_response(content)
         except Exception as e:
-            logger.error("LLM call failed (%s): %s", model, e)
+            logger.error("LLM call gagal (%s): %s", model, e)
             return None
 
     def _parse_response(self, content: str) -> Optional[dict]:
-        """Extract and validate JSON from LLM response."""
-        # Strip markdown code blocks if present
+        # Hapus markdown code block jika ada
         content = re.sub(r"```(?:json)?\s*", "", content).strip().rstrip("`").strip()
 
         try:
             data = json.loads(content)
         except json.JSONDecodeError:
-            # Try to find JSON object in free text
             match = re.search(r"\{.*\}", content, re.DOTALL)
             if match:
                 try:
                     data = json.loads(match.group())
                 except json.JSONDecodeError:
-                    logger.error("Failed to parse LLM JSON response")
+                    logger.error("Gagal parse JSON dari LLM")
                     return None
             else:
-                logger.error("No JSON found in LLM response")
+                logger.error("Tidak ada JSON dalam respons LLM")
                 return None
 
-        picks = data.get("picks", [])
-        if not picks:
-            logger.error("No picks in LLM response")
+        # Validasi besar_kecil
+        bk_data = data.get("besar_kecil", {})
+        bk_choice = str(bk_data.get("choice", "")).upper()
+        if bk_choice not in ("BE", "KE"):
+            logger.error("choice besar_kecil tidak valid: %s", bk_choice)
             return None
 
-        validated = []
-        seen = set()
-        for pick in picks:
-            num = str(pick.get("number", "")).zfill(2)
-            if not re.match(r"^\d{2}$", num):
-                continue
-            if num in seen:
-                continue
-            seen.add(num)
-            validated.append({
-                "number": num,
-                "confidence": float(pick.get("confidence", 0.5)),
-                "reason": str(pick.get("reason", "")),
-            })
-            if len(validated) >= NUM_PICKS:
-                break
-
-        if not validated:
-            logger.error("No valid picks after validation")
+        # Validasi genap_ganjil
+        gj_data = data.get("genap_ganjil", {})
+        gj_choice = str(gj_data.get("choice", "")).upper()
+        if gj_choice not in ("GE", "GA"):
+            logger.error("choice genap_ganjil tidak valid: %s", gj_choice)
             return None
 
         return {
-            "picks": validated,
-            "analysis": data.get("analysis", ""),
+            "besar_kecil": {
+                "choice":     bk_choice,
+                "confidence": float(bk_data.get("confidence", 0.5)),
+                "reason":     str(bk_data.get("reason", "")),
+            },
+            "genap_ganjil": {
+                "choice":     gj_choice,
+                "confidence": float(gj_data.get("confidence", 0.5)),
+                "reason":     str(gj_data.get("reason", "")),
+            },
+            "stats": data.get("stats", {}),
         }

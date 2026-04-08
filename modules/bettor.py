@@ -1,8 +1,11 @@
-"""Bet placement module for partai34848.com."""
+"""
+Bet placement — submit 50 angka per kategori (BE/KE/GE/GA) ke /games/4d/send.
+
+Satu "bet" = 50 angka × bet_amount_per_angka dikirim dalam 1 POST request.
+BET FULL (type=B): hadiah x100 per angka yang cocok.
+"""
 
 import logging
-import json
-import re
 from typing import Optional
 
 import httpx
@@ -12,6 +15,7 @@ from config import (
     MIN_BET, MAX_BET_2D, AJAX_HEADERS,
 )
 from modules.auth import AuthManager
+from modules.categories import get_numbers_for_category, classify_result, CHOICE_LABELS
 
 logger = logging.getLogger(__name__)
 
@@ -20,87 +24,60 @@ class Bettor:
     def __init__(self, auth: AuthManager) -> None:
         self._auth = auth
 
-    # ─── Validation ──────────────────────────────────────────────────────────
+    # ─── Place single bet (satu dimensi) ─────────────────────────────────────
 
-    @staticmethod
-    def validate_numbers(numbers: list[str]) -> list[str]:
-        """Validate and deduplicate 2D numbers. Returns cleaned list."""
-        cleaned = []
-        seen = set()
-        for num in numbers:
-            num = str(num).strip().zfill(2)
-            if not re.match(r"^\d{2}$", num):
-                logger.warning("Invalid number skipped: %s", num)
-                continue
-            if num in seen:
-                logger.warning("Duplicate number skipped: %s", num)
-                continue
-            seen.add(num)
-            cleaned.append(num)
-        return cleaned
-
-    @staticmethod
-    def idr_to_bet_param(amount_idr: int) -> str:
-        """Convert IDR amount to bet parameter (in thousands). Rp 1000 → '1'."""
-        val = amount_idr / 1000
-        # Format cleanly: no trailing zeros for whole numbers
-        if val == int(val):
-            return str(int(val))
-        return str(round(val, 3))
-
-    # ─── Bet placement ───────────────────────────────────────────────────────
-
-    async def place_bets(
+    async def place_bet(
         self,
-        numbers: list[str],
-        bet_amount_idr: int,
+        choice: str,
+        bet_amount_per_angka: int,
         dry_run: bool = False,
     ) -> Optional[dict]:
         """
-        Place 2D bets on the given numbers.
+        Pasang satu bet untuk pilihan BE/KE/GE/GA.
 
         Args:
-            numbers: list of 2-digit strings to bet on.
-            bet_amount_idr: IDR amount per number.
-            dry_run: if True, log the bet but do not submit.
+            choice:               "BE" | "KE" | "GE" | "GA"
+            bet_amount_per_angka: IDR per angka (min Rp 100)
+            dry_run:              jika True tidak kirim ke API
 
         Returns:
-            Parsed API response dict, or a dry-run placeholder.
+            dict respons API atau dry-run placeholder.
         """
-        numbers = self.validate_numbers(numbers)
-        if not numbers:
-            logger.error("No valid numbers to bet")
+        if choice not in ("BE", "KE", "GE", "GA"):
+            logger.error("Pilihan tidak valid: %s", choice)
             return None
 
-        # Clamp bet amount
-        bet_amount_idr = max(MIN_BET, min(MAX_BET_2D, bet_amount_idr))
-        bet_param = self.idr_to_bet_param(bet_amount_idr)
-
-        # Build form payload
-        payload: dict[str, str] = {
-            "type": BET_TYPE,
-            "game": GAME_TYPE,
-            "bet": bet_param,
-            "posisi": BET_POSISI,
-            "sar": POOL_ID,
-        }
-        for i, num in enumerate(numbers, start=1):
-            payload[f"cek{i}"] = "1"
-            payload[f"tebak{i}"] = num
+        bet_amount_per_angka = max(MIN_BET, min(MAX_BET_2D, bet_amount_per_angka))
+        numbers   = get_numbers_for_category(choice)
+        bet_param = self._to_bet_param(bet_amount_per_angka)
+        total_idr = bet_amount_per_angka * len(numbers)
 
         logger.info(
-            "Betting: numbers=%s amount=Rp%s/number total=Rp%s dry_run=%s",
-            numbers, bet_amount_idr, bet_amount_idr * len(numbers), dry_run,
+            "Bet %s (%s): %d angka × Rp%s = Rp%s | dry=%s",
+            choice, CHOICE_LABELS[choice], len(numbers), bet_amount_per_angka, total_idr, dry_run,
         )
 
         if dry_run:
             return {
-                "status": "dry_run",
-                "numbers": numbers,
-                "bet_amount": bet_amount_idr,
-                "total": bet_amount_idr * len(numbers),
-                "payload": payload,
+                "status":   "dry_run",
+                "choice":   choice,
+                "label":    CHOICE_LABELS[choice],
+                "numbers":  numbers,
+                "total_idr": total_idr,
             }
+
+        # Build form payload
+        payload: dict[str, str] = {
+            "type":   BET_TYPE,
+            "ganti":  "F",
+            "game":   GAME_TYPE,
+            "bet":    bet_param,
+            "posisi": BET_POSISI,
+            "sar":    POOL_ID,
+        }
+        for i, num in enumerate(numbers, start=1):
+            payload[f"cek{i}"]   = "1"
+            payload[f"tebak{i}"] = num
 
         client = await self._auth.get_client()
         try:
@@ -113,57 +90,92 @@ class Bettor:
                 },
             )
             raw = resp.text
-            logger.debug("Bet API raw response: %s", raw)
+            logger.debug("API resp (%s): %s", choice, raw[:300])
 
             try:
                 data = resp.json()
             except Exception:
                 data = {"raw": raw}
 
-            data["_numbers"] = numbers
-            data["_bet_amount"] = bet_amount_idr
+            data["_choice"]    = choice
+            data["_label"]     = CHOICE_LABELS[choice]
+            data["_total_idr"] = total_idr
 
-            success = data.get("status") in (1, "1", True, "true", "ok", "success")
-            if success:
+            ok = data.get("status") in (1, "1", True, "true", "ok", "success")
+            if ok:
                 logger.info(
-                    "Bet placed OK: periode=%s transaksi=%s balance=%s",
-                    data.get("periode"),
-                    data.get("transaksi"),
-                    data.get("balance"),
+                    "Bet OK — %s | periode=%s balance=%s",
+                    choice, data.get("periode"), data.get("balance"),
                 )
             else:
-                logger.error("Bet placement failed: %s", data)
+                logger.error("Bet GAGAL — %s: %s", choice, data)
 
             return data
 
         except Exception as e:
-            logger.error("Bet request failed: %s", e)
+            logger.error("Request gagal (%s): %s", choice, e)
             return None
 
-    # ─── Win check ───────────────────────────────────────────────────────────
+    # ─── Double bet (BK + GJ sekaligus) ──────────────────────────────────────
+
+    async def place_double_bet(
+        self,
+        bk_choice: str,
+        gj_choice: str,
+        bk_amount: int,
+        gj_amount: int,
+        dry_run: bool = False,
+    ) -> list[dict]:
+        """
+        Pasang 2 bet: satu untuk BK, satu untuk GJ.
+
+        Return list 2 respons: [bk_result, gj_result]
+        """
+        bk_result = await self.place_bet(bk_choice, bk_amount, dry_run=dry_run)
+        gj_result = await self.place_bet(gj_choice, gj_amount, dry_run=dry_run)
+        return [bk_result, gj_result]
+
+    # ─── Win check ────────────────────────────────────────────────────────────
 
     @staticmethod
-    def check_win(numbers_bet: list[str], draw_result: str) -> tuple[bool, str | None]:
+    def check_win(bet_choice: str, result_2d: str) -> bool:
         """
-        Check if any bet number matches the draw result.
+        Cek apakah bet menang.
 
-        For 2D belakang, we match the last 2 digits of the result.
-        Returns (won: bool, winning_number: str | None).
+        Args:
+            bet_choice: "BE" | "KE" | "GE" | "GA"
+            result_2d:  2 digit belakang yang keluar, misal "95"
+
+        Returns:
+            True jika menang.
         """
-        result_clean = str(draw_result).strip()
-        # Extract last 2 digits
-        digits = re.sub(r"\D", "", result_clean)
-        last_two = digits[-2:] if len(digits) >= 2 else digits.zfill(2)
-
-        for num in numbers_bet:
-            if num == last_two:
-                return True, num
-        return False, None
+        cat = classify_result(result_2d)
+        if bet_choice in ("BE", "KE"):
+            return cat["besar_kecil"] == bet_choice
+        else:
+            return cat["genap_ganjil"] == bet_choice
 
     @staticmethod
-    def calculate_payout(bet_amount_idr: int, num_numbers: int) -> int:
+    def calculate_payout(
+        bet_amount_per_angka: int,
+        won: bool,
+        payout_multiplier: int = 100,
+    ) -> dict:
         """
-        Calculate potential payout for type=B (full) 2D bet.
-        Payout is x100 per winning number; total wagered = bet_amount * num_numbers.
+        Hitung payout satu bet.
+        Wagered = bet_amount_per_angka × 50 angka.
+        Won     = bet_amount_per_angka × payout_multiplier (jika menang).
         """
-        return bet_amount_idr * 100  # per winning number
+        wagered = bet_amount_per_angka * 50
+        win_amt = bet_amount_per_angka * payout_multiplier if won else 0
+        return {
+            "wagered": wagered,
+            "won":     win_amt,
+            "net":     win_amt - wagered,
+        }
+
+    @staticmethod
+    def _to_bet_param(amount_idr: int) -> str:
+        """Konversi IDR ke satuan ribu untuk API. Rp 100 → '0.1'"""
+        val = amount_idr / 1000
+        return str(int(val)) if val == int(val) else str(round(val, 3))

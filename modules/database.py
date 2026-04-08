@@ -1,4 +1,4 @@
-"""SQLite database layer for the Hokidraw bot."""
+"""SQLite database layer — schema sesuai blueprint terbaru."""
 
 import os
 import logging
@@ -11,36 +11,43 @@ logger = logging.getLogger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS results (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    periode    TEXT    UNIQUE NOT NULL,
-    result     TEXT    NOT NULL,
-    draw_time  TEXT    NOT NULL,
-    created_at TEXT    DEFAULT CURRENT_TIMESTAMP
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    period               TEXT    UNIQUE NOT NULL,
+    draw_time            TEXT    NOT NULL,
+    full_number          TEXT    NOT NULL,       -- 4 digit: "1295"
+    number_2d_depan      TEXT,                   -- "12"
+    number_2d_tengah     TEXT,                   -- "29"
+    number_2d_belakang   TEXT    NOT NULL,       -- "95"
+    belakang_bk          TEXT    NOT NULL,       -- "BE" | "KE"
+    belakang_gj          TEXT    NOT NULL,       -- "GE" | "GA"
+    created_at           TEXT    DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS bets (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    periode          TEXT    NOT NULL,
-    numbers          TEXT    NOT NULL,
-    bet_amount       INTEGER NOT NULL,
-    martingale_level INTEGER NOT NULL,
-    status           TEXT    DEFAULT 'pending',
-    win_amount       INTEGER DEFAULT 0,
-    raw_response     TEXT,
-    created_at       TEXT    DEFAULT CURRENT_TIMESTAMP,
-    updated_at       TEXT    DEFAULT CURRENT_TIMESTAMP
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    period                 TEXT    NOT NULL,
+    bet_dimension          TEXT    NOT NULL,   -- "besar_kecil" | "genap_ganjil"
+    bet_choice             TEXT    NOT NULL,   -- "BE" | "KE" | "GE" | "GA"
+    bet_amount_per_angka   REAL    NOT NULL,   -- Rp per angka (integer IDR)
+    total_amount           REAL    NOT NULL,   -- bet_amount_per_angka × 50 × 1000 (Rupiah)
+    martingale_level       INTEGER NOT NULL,
+    confidence             REAL    DEFAULT 0,
+    status                 TEXT    DEFAULT 'placed',  -- placed | won | lost
+    win_amount             REAL    DEFAULT 0,
+    result_2d              TEXT,              -- 2D belakang yang keluar
+    result_match           TEXT,              -- "BE"/"KE"/"GE"/"GA" yang keluar
+    api_response           TEXT,
+    created_at             TEXT    DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS daily_stats (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    date          TEXT    UNIQUE NOT NULL,
-    total_bets    INTEGER DEFAULT 0,
-    total_wagered INTEGER DEFAULT 0,
-    total_won     INTEGER DEFAULT 0,
-    net_result    INTEGER DEFAULT 0,
-    win_count     INTEGER DEFAULT 0,
-    loss_count    INTEGER DEFAULT 0,
-    created_at    TEXT    DEFAULT CURRENT_TIMESTAMP
+    date             TEXT PRIMARY KEY,
+    total_bets       INTEGER DEFAULT 0,
+    total_wins       INTEGER DEFAULT 0,
+    total_bet_amount REAL    DEFAULT 0,
+    total_win_amount REAL    DEFAULT 0,
+    profit           REAL    DEFAULT 0,
+    ending_balance   REAL    DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS bot_state (
@@ -50,31 +57,52 @@ CREATE TABLE IF NOT EXISTS bot_state (
 );
 """
 
+# Keys untuk bot_state:
+#   consecutive_losses_bk  — streak kalah untuk dimensi BK
+#   consecutive_losses_gj  — streak kalah untuk dimensi GJ
+#   martingale_level_bk    — level martingale BK saat ini
+#   martingale_level_gj    — level martingale GJ saat ini
+#   last_period            — periode terakhir yang diproses
+#   daily_loss             — total kerugian hari ini (Rupiah)
+
 
 # ─── Init ─────────────────────────────────────────────────────────────────────
 
 async def init_db() -> None:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
-        for statement in _SCHEMA.strip().split(";"):
-            s = statement.strip()
+        for stmt in _SCHEMA.strip().split(";"):
+            s = stmt.strip()
             if s:
                 await db.execute(s)
         await db.commit()
-    logger.info("Database initialised at %s", DB_PATH)
+    logger.info("Database siap: %s", DB_PATH)
 
 
 # ─── Results ──────────────────────────────────────────────────────────────────
 
-async def save_result(periode: str, result: str, draw_time: str) -> bool:
-    """Insert a new draw result. Returns True if inserted, False if duplicate."""
+async def save_result(
+    period: str,
+    draw_time: str,
+    full_number: str,
+    depan: str,
+    tengah: str,
+    belakang: str,
+    belakang_bk: str,
+    belakang_gj: str,
+) -> bool:
+    """Simpan hasil draw baru. Return True jika berhasil insert, False jika duplikat."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "INSERT OR IGNORE INTO results (periode, result, draw_time) VALUES (?, ?, ?)",
-            (periode, result, draw_time),
+        cur = await db.execute(
+            """INSERT OR IGNORE INTO results
+               (period, draw_time, full_number,
+                number_2d_depan, number_2d_tengah, number_2d_belakang,
+                belakang_bk, belakang_gj)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (period, draw_time, full_number, depan, tengah, belakang, belakang_bk, belakang_gj),
         )
         await db.commit()
-        return cursor.rowcount > 0
+        return cur.rowcount > 0
 
 
 async def get_recent_results(limit: int = 200) -> list[dict]:
@@ -96,10 +124,10 @@ async def get_last_result() -> dict | None:
             return dict(row) if row else None
 
 
-async def result_exists(periode: str) -> bool:
+async def result_exists(period: str) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT 1 FROM results WHERE periode = ?", (periode,)
+            "SELECT 1 FROM results WHERE period = ?", (period,)
         ) as cur:
             return await cur.fetchone() is not None
 
@@ -107,50 +135,66 @@ async def result_exists(periode: str) -> bool:
 # ─── Bets ─────────────────────────────────────────────────────────────────────
 
 async def save_bet(
-    periode: str,
-    numbers: list[str],
-    bet_amount: int,
+    period: str,
+    dimension: str,          # "besar_kecil" | "genap_ganjil"
+    choice: str,             # "BE" | "KE" | "GE" | "GA"
+    bet_amount_per_angka: int,
+    total_amount: int,
     martingale_level: int,
-    raw_response: str | None = None,
+    confidence: float = 0.0,
+    api_response: str | None = None,
 ) -> int:
+    """Simpan satu bet (satu dimensi). Return ID row."""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            """INSERT INTO bets (periode, numbers, bet_amount, martingale_level, raw_response)
-               VALUES (?, ?, ?, ?, ?)""",
-            (periode, ",".join(numbers), bet_amount, martingale_level, raw_response),
+            """INSERT INTO bets
+               (period, bet_dimension, bet_choice,
+                bet_amount_per_angka, total_amount,
+                martingale_level, confidence, api_response)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (period, dimension, choice,
+             bet_amount_per_angka, total_amount,
+             martingale_level, confidence, api_response),
         )
         await db.commit()
         return cur.lastrowid
 
 
-async def update_bet_result(bet_id: int, status: str, win_amount: int = 0) -> None:
+async def settle_bet(
+    bet_id: int,
+    status: str,           # "won" | "lost"
+    win_amount: int,
+    result_2d: str,
+    result_match: str,     # kategori yang keluar: "BE"/"KE"/"GE"/"GA"
+) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """UPDATE bets
-               SET status = ?, win_amount = ?, updated_at = CURRENT_TIMESTAMP
+               SET status = ?, win_amount = ?,
+                   result_2d = ?, result_match = ?
                WHERE id = ?""",
-            (status, win_amount, bet_id),
+            (status, win_amount, result_2d, result_match, bet_id),
         )
         await db.commit()
 
 
-async def get_pending_bets() -> list[dict]:
+async def get_placed_bets(period: str) -> list[dict]:
+    """Ambil semua bet berstatus 'placed' untuk periode tertentu."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM bets WHERE status = 'pending' ORDER BY id DESC"
+            "SELECT * FROM bets WHERE period = ? AND status = 'placed'", (period,)
         ) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
 
-async def get_bet_by_periode(periode: str) -> dict | None:
+async def get_all_placed_bets() -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM bets WHERE periode = ? LIMIT 1", (periode,)
+            "SELECT * FROM bets WHERE status = 'placed' ORDER BY id"
         ) as cur:
-            row = await cur.fetchone()
-            return dict(row) if row else None
+            return [dict(r) for r in await cur.fetchall()]
 
 
 # ─── Bot state ────────────────────────────────────────────────────────────────
@@ -179,22 +223,35 @@ async def set_state(key: str, value: str) -> None:
 # ─── Daily stats ──────────────────────────────────────────────────────────────
 
 async def update_daily_stats(
-    date: str, wagered: int, won: int, is_win: bool
+    date: str,
+    bet_amount: int,
+    win_amount: int,
+    is_win: bool,
 ) -> None:
-    net = won - wagered
+    profit = win_amount - bet_amount
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO daily_stats
-               (date, total_bets, total_wagered, total_won, net_result, win_count, loss_count)
-               VALUES (?, 1, ?, ?, ?, ?, ?)
+               (date, total_bets, total_wins, total_bet_amount, total_win_amount, profit)
+               VALUES (?, 1, ?, ?, ?, ?)
                ON CONFLICT(date) DO UPDATE SET
-                   total_bets    = total_bets + 1,
-                   total_wagered = total_wagered + excluded.total_wagered,
-                   total_won     = total_won     + excluded.total_won,
-                   net_result    = net_result    + excluded.net_result,
-                   win_count     = win_count     + excluded.win_count,
-                   loss_count    = loss_count    + excluded.loss_count""",
-            (date, wagered, won, net, 1 if is_win else 0, 0 if is_win else 1),
+                   total_bets       = total_bets + 1,
+                   total_wins       = total_wins + excluded.total_wins,
+                   total_bet_amount = total_bet_amount + excluded.total_bet_amount,
+                   total_win_amount = total_win_amount + excluded.total_win_amount,
+                   profit           = profit + excluded.profit""",
+            (date, 1 if is_win else 0, bet_amount, win_amount, profit),
+        )
+        await db.commit()
+
+
+async def set_daily_ending_balance(date: str, balance: float) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO daily_stats (date, ending_balance)
+               VALUES (?, ?)
+               ON CONFLICT(date) DO UPDATE SET ending_balance = excluded.ending_balance""",
+            (date, balance),
         )
         await db.commit()
 
