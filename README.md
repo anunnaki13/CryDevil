@@ -1,4 +1,4 @@
-# Hokidraw 2D Auto-Betting Bot
+#  Bot
 
 Bot otomatis untuk memasang taruhan **2D Belakang (Besar/Kecil + Genap/Ganjil)** pada pasaran Hokidraw.
 Menggunakan **OpenRouter LLM** untuk analisis pola dan prediksi, **Telegram** untuk notifikasi real-time.
