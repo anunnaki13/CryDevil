@@ -74,12 +74,21 @@ LLM_MAX_TOKENS      = 1000
 HISTORY_WINDOW      = 200  # jumlah periode untuk analisis LLM
 
 # ─── 4. Nominal bet ──────────────────────────────────────────────────────────
-# BASE_BET = nominal per ANGKA (IDR). Setiap kategori = 50 angka × BASE_BET.
-# Contoh BASE_BET=100: 50 angka × Rp100 = Rp5.000/bet
+# BASE_BET = nominal per ANGKA (IDR).
+#
+# Cara hitung API param `bet`:
+#   Panel situs: IDR 1.000 = 1  →  bet = BASE_BET / 1000
+#   Contoh BASE_BET=100: bet=0.1, total = 0.1 × 1.000 × 50 angka = Rp 5.000
+#   Contoh BASE_BET=200: bet=0.2, total = 0.2 × 1.000 × 50 angka = Rp 10.000
+#
 BASE_BET   = _int("BASE_BET",  100)   # Rp/angka (min Rp 100)
-BET_TYPE   = _optional("BET_TYPE", "B")  # B=full (x100), D=diskon
 MIN_BET    = 100
 MAX_BET_2D = 2_000_000
+
+# Tipe bet — SELALU Bet Full (type=B), payout x100.
+# Tidak diambil dari .env agar tidak bisa diubah tidak sengaja.
+# B = Bet Full | D = Bet Diskon | A = Bet BB (Bolak-Balik)
+BET_TYPE   = "B"
 
 # Mode bet per periode:
 #   "double" = 2 bet (BK + GJ) → total 2 × Rp5.000 = Rp10.000
@@ -185,9 +194,6 @@ def validate_config(exit_on_error: bool = True) -> bool:
             f"(kurang dari 1 round = Rp{BASE_BET * 50 * 2:,})"
         )
 
-    if BET_TYPE not in ("B", "D", "A"):
-        logic_errors.append(f"  BET_TYPE='{BET_TYPE}' tidak valid. Pilih: B, D, atau A")
-
     if BET_MODE not in ("single", "double"):
         logic_errors.append(f"  BET_MODE='{BET_MODE}' tidak valid. Pilih: single atau double")
 
@@ -208,7 +214,7 @@ def validate_config(exit_on_error: bool = True) -> bool:
         print(f"  Username     : {USERNAME}")
         print(f"  LLM Model    : {LLM_PRIMARY}")
         print(f"  Posisi       : 2D Belakang")
-        print(f"  Bet/angka    : Rp{BASE_BET:,}  |  Tipe: {BET_TYPE}  |  Mode: {BET_MODE}")
+        print(f"  Bet/angka    : Rp{BASE_BET:,}  |  bet param: {BASE_BET/1000}  |  Tipe: BET FULL (B)  |  Mode: {BET_MODE}")
         print(f"  Total/round  : Rp{total:,}  (50 angka × {'2 bet' if BET_MODE=='double' else '1 bet'} × Rp{BASE_BET:,})")
         print(f"  Pot. menang  : Rp{BASE_BET * 100:,}/bet (100x)")
         lv_str = " → ".join(f"Rp{x:,}" for x in MARTINGALE_LEVELS)
