@@ -1,4 +1,4 @@
-"""LLM-based number predictor using OpenRouter API."""
+"""LLM-based predictor untuk kategori Besar/Kecil dan Genap/Ganjil."""
 
 import json
 import logging
@@ -11,39 +11,51 @@ from config import (
     OPENROUTER_API_KEY, OPENROUTER_BASE_URL,
     LLM_PRIMARY, LLM_FALLBACK,
     LLM_TEMPERATURE, LLM_MAX_TOKENS,
-    NUM_PICKS,
+    BET_POSITIONS,
 )
+from modules.categories import parse_result, result_summary
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = """You are a data analyst specializing in lottery pattern analysis.
-Analyze the provided 2D lottery draw history and identify the most likely numbers for the next draw.
-Base your analysis on statistical patterns only — not superstition.
+_SYSTEM_PROMPT = """Kamu adalah analis statistik togel yang ahli analisis pola data.
+Tugasmu menganalisis history hasil 2D togel Hokidraw dan memprediksi kategori untuk draw berikutnya.
 
-Respond ONLY with valid JSON in this exact format:
+Setiap hasil 4D dibagi 3 posisi:
+- DEPAN    = 2 digit pertama (misal "12" dari "1295")
+- TENGAH   = 2 digit tengah  (misal "29" dari "1295")
+- BELAKANG = 2 digit terakhir (misal "95" dari "1295")
+
+Aturan klasifikasi per pasangan:
+- Besar/Kecil → digit PERTAMA pasangan: 0-4=Kecil, 5-9=Besar
+- Genap/Ganjil → digit KEDUA pasangan: 0,2,4,6,8=Genap; 1,3,5,7,9=Ganjil
+
+Analisis pola distribusi, streak, dan frekuensi untuk setiap posisi.
+Jawab HANYA dengan JSON valid, tanpa teks lain:
 {
-  "picks": [
-    {"number": "XX", "confidence": 0.0-1.0, "reason": "brief reason"},
-    ...
+  "predictions": [
+    {
+      "position": "belakang",
+      "besar_kecil": "besar",
+      "bk_confidence": 0.65,
+      "bk_reason": "alasan singkat maks 15 kata",
+      "genap_ganjil": "ganjil",
+      "gj_confidence": 0.60,
+      "gj_reason": "alasan singkat maks 15 kata"
+    }
   ],
-  "analysis": "brief overall analysis summary (max 3 sentences)"
+  "analysis": "ringkasan analisis maks 3 kalimat"
 }
 
-Rules:
-- Provide exactly """ + str(NUM_PICKS) + """ picks
-- Numbers must be 2-digit strings from "00" to "99"
-- No duplicate numbers
-- Confidence between 0.01 and 0.99
-- Keep reasons concise (under 15 words each)
+Satu objek dalam "predictions" per posisi yang diminta.
+Confidence antara 0.01–0.99.
 """
 
-_USER_PROMPT_TEMPLATE = """Here are the last {count} draw results for the Hokidraw 2D lottery market
-(most recent first, format: periode | result):
+_USER_TEMPLATE = """Berikut {count} hasil draw terakhir Hokidraw (terbaru di atas):
 
 {history}
 
-Based on these results, predict the top {num_picks} most likely 2D numbers for the next draw.
-Consider: hot numbers, cold/overdue numbers, digit frequency, consecutive patterns, and recent trends."""
+Prediksi kategori draw BERIKUTNYA untuk posisi: {positions}
+Berikan analisis berdasarkan distribusi, streak berturut-turut, dan pola yang terlihat."""
 
 
 class Predictor:
@@ -55,30 +67,37 @@ class Predictor:
 
     async def predict(self, history: list[dict]) -> Optional[dict]:
         """
-        Predict next draw numbers from history.
+        Prediksi kategori BK/GJ dari history draw.
 
         Args:
-            history: list of dicts with 'periode' and 'result' keys, most recent first.
+            history: list dict dengan key 'result' (4-digit string), terbaru pertama.
 
         Returns:
-            dict with 'picks' (list of {number, confidence, reason}) and 'analysis'.
+            dict dengan 'predictions' dan 'analysis', atau None jika gagal.
         """
         if not history:
-            logger.warning("No history provided for prediction")
+            logger.warning("History kosong, tidak bisa prediksi")
             return None
 
-        history_text = "\n".join(
-            f"{h['periode']} | {h['result']}" for h in history[:200]
-        )
-        user_prompt = _USER_PROMPT_TEMPLATE.format(
-            count=len(history[:200]),
-            history=history_text,
-            num_picks=NUM_PICKS,
+        # Bangun teks history dengan kategori sudah dihitung
+        lines = []
+        for h in history[:200]:
+            parsed = parse_result(h.get("result", ""))
+            if parsed:
+                lines.append(f"{h.get('periode', '?')} | {result_summary(parsed)}")
+            else:
+                lines.append(f"{h.get('periode', '?')} | {h.get('result', '?')}")
+
+        positions_str = ", ".join(BET_POSITIONS)
+        user_prompt = _USER_TEMPLATE.format(
+            count=len(lines),
+            history="\n".join(lines),
+            positions=positions_str,
         )
 
         result = await self._call_llm(LLM_PRIMARY, user_prompt)
         if result is None:
-            logger.warning("Primary model failed, trying fallback")
+            logger.warning("Model utama gagal, coba fallback")
             result = await self._call_llm(LLM_FALLBACK, user_prompt)
 
         return result
@@ -89,65 +108,73 @@ class Predictor:
                 model=model,
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
+                    {"role": "user",   "content": user_prompt},
                 ],
                 temperature=LLM_TEMPERATURE,
                 max_tokens=LLM_MAX_TOKENS,
             )
             content = response.choices[0].message.content
-            logger.debug("LLM raw response (%s): %s", model, content)
+            logger.debug("LLM raw (%s): %s", model, content)
             return self._parse_response(content)
         except Exception as e:
-            logger.error("LLM call failed (%s): %s", model, e)
+            logger.error("LLM call gagal (%s): %s", model, e)
             return None
 
     def _parse_response(self, content: str) -> Optional[dict]:
-        """Extract and validate JSON from LLM response."""
-        # Strip markdown code blocks if present
+        # Hapus markdown code block jika ada
         content = re.sub(r"```(?:json)?\s*", "", content).strip().rstrip("`").strip()
 
         try:
             data = json.loads(content)
         except json.JSONDecodeError:
-            # Try to find JSON object in free text
             match = re.search(r"\{.*\}", content, re.DOTALL)
             if match:
                 try:
                     data = json.loads(match.group())
                 except json.JSONDecodeError:
-                    logger.error("Failed to parse LLM JSON response")
+                    logger.error("Gagal parse JSON dari LLM")
                     return None
             else:
-                logger.error("No JSON found in LLM response")
+                logger.error("Tidak ada JSON dalam respons LLM")
                 return None
 
-        picks = data.get("picks", [])
-        if not picks:
-            logger.error("No picks in LLM response")
+        predictions = data.get("predictions", [])
+        if not predictions:
+            logger.error("Tidak ada predictions dalam respons LLM")
             return None
 
         validated = []
-        seen = set()
-        for pick in picks:
-            num = str(pick.get("number", "")).zfill(2)
-            if not re.match(r"^\d{2}$", num):
+        for p in predictions:
+            pos = str(p.get("position", "")).lower()
+            if pos not in ("depan", "tengah", "belakang"):
+                logger.warning("Posisi tidak valid dilewati: %s", pos)
                 continue
-            if num in seen:
+
+            bk = str(p.get("besar_kecil", "")).lower()
+            gj = str(p.get("genap_ganjil", "")).lower()
+
+            if bk not in ("besar", "kecil"):
+                logger.warning("besar_kecil tidak valid: %s", bk)
                 continue
-            seen.add(num)
+            if gj not in ("genap", "ganjil"):
+                logger.warning("genap_ganjil tidak valid: %s", gj)
+                continue
+
             validated.append({
-                "number": num,
-                "confidence": float(pick.get("confidence", 0.5)),
-                "reason": str(pick.get("reason", "")),
+                "position":      pos,
+                "besar_kecil":   bk,
+                "bk_confidence": float(p.get("bk_confidence", 0.5)),
+                "bk_reason":     str(p.get("bk_reason", "")),
+                "genap_ganjil":  gj,
+                "gj_confidence": float(p.get("gj_confidence", 0.5)),
+                "gj_reason":     str(p.get("gj_reason", "")),
             })
-            if len(validated) >= NUM_PICKS:
-                break
 
         if not validated:
-            logger.error("No valid picks after validation")
+            logger.error("Tidak ada prediksi valid setelah validasi")
             return None
 
         return {
-            "picks": validated,
+            "predictions": validated,
             "analysis": data.get("analysis", ""),
         }

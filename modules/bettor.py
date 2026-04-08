@@ -1,7 +1,17 @@
-"""Bet placement module for partai34848.com."""
+"""
+Bet placement untuk kategori Besar/Kecil dan Genap/Ganjil.
+
+Cara kerja:
+  Betting "Besar belakang" = pasang semua 50 angka yang digit pertamanya 5-9.
+  Betting "Genap belakang" = pasang semua 50 angka yang digit keduanya 0/2/4/6/8.
+  Setiap kategori = 50 angka, dikirim dalam satu POST request.
+
+  Pot win per kategori (type=B, full):
+    Rp 100/nomor × 50 nomor = Rp 5.000 total taruhan
+    Menang: 1 nomor cocok × 100x = Rp 10.000  →  profit bersih Rp 5.000
+"""
 
 import logging
-import json
 import re
 from typing import Optional
 
@@ -12,94 +22,106 @@ from config import (
     MIN_BET, MAX_BET_2D, AJAX_HEADERS,
 )
 from modules.auth import AuthManager
+from modules.categories import get_numbers_for_category, parse_result
 
 logger = logging.getLogger(__name__)
+
+# Peta posisi → nilai `posisi` di API
+_POSISI_MAP = {
+    "depan":    "depan",
+    "tengah":   "tengah",
+    "belakang": "belakang",
+}
 
 
 class Bettor:
     def __init__(self, auth: AuthManager) -> None:
         self._auth = auth
 
-    # ─── Validation ──────────────────────────────────────────────────────────
+    # ─── Bet per kategori ─────────────────────────────────────────────────────
 
-    @staticmethod
-    def validate_numbers(numbers: list[str]) -> list[str]:
-        """Validate and deduplicate 2D numbers. Returns cleaned list."""
-        cleaned = []
-        seen = set()
-        for num in numbers:
-            num = str(num).strip().zfill(2)
-            if not re.match(r"^\d{2}$", num):
-                logger.warning("Invalid number skipped: %s", num)
-                continue
-            if num in seen:
-                logger.warning("Duplicate number skipped: %s", num)
-                continue
-            seen.add(num)
-            cleaned.append(num)
-        return cleaned
-
-    @staticmethod
-    def idr_to_bet_param(amount_idr: int) -> str:
-        """Convert IDR amount to bet parameter (in thousands). Rp 1000 → '1'."""
-        val = amount_idr / 1000
-        # Format cleanly: no trailing zeros for whole numbers
-        if val == int(val):
-            return str(int(val))
-        return str(round(val, 3))
-
-    # ─── Bet placement ───────────────────────────────────────────────────────
-
-    async def place_bets(
+    async def place_category_bet(
         self,
-        numbers: list[str],
-        bet_amount_idr: int,
+        position: str,
+        bk_category: str,
+        gj_category: str,
+        bet_per_number_idr: int,
         dry_run: bool = False,
     ) -> Optional[dict]:
         """
-        Place 2D bets on the given numbers.
+        Pasang 2 bet dalam 1 round: Besar/Kecil + Genap/Ganjil untuk satu posisi.
 
         Args:
-            numbers: list of 2-digit strings to bet on.
-            bet_amount_idr: IDR amount per number.
-            dry_run: if True, log the bet but do not submit.
+            position:          "depan" | "tengah" | "belakang"
+            bk_category:       "besar" | "kecil"
+            gj_category:       "genap" | "ganjil"
+            bet_per_number_idr: IDR per nomor (min Rp 100)
+            dry_run:           jika True, tidak kirim ke API
 
         Returns:
-            Parsed API response dict, or a dry-run placeholder.
+            dict hasil API atau dry-run placeholder.
         """
-        numbers = self.validate_numbers(numbers)
-        if not numbers:
-            logger.error("No valid numbers to bet")
+        if position not in _POSISI_MAP:
+            logger.error("Posisi tidak valid: %s", position)
             return None
 
-        # Clamp bet amount
-        bet_amount_idr = max(MIN_BET, min(MAX_BET_2D, bet_amount_idr))
-        bet_param = self.idr_to_bet_param(bet_amount_idr)
+        bet_per_number_idr = max(MIN_BET, min(MAX_BET_2D, bet_per_number_idr))
 
-        # Build form payload
-        payload: dict[str, str] = {
-            "type": BET_TYPE,
-            "game": GAME_TYPE,
-            "bet": bet_param,
-            "posisi": BET_POSISI,
-            "sar": POOL_ID,
+        # Bet 1: Besar atau Kecil
+        result_bk = await self._submit_category(
+            position, bk_category, bet_per_number_idr, dry_run
+        )
+
+        # Bet 2: Genap atau Ganjil
+        result_gj = await self._submit_category(
+            position, gj_category, bet_per_number_idr, dry_run
+        )
+
+        return {
+            "bk": result_bk,
+            "gj": result_gj,
+            "position": position,
+            "bk_category": bk_category,
+            "gj_category": gj_category,
+            "bet_per_number": bet_per_number_idr,
         }
-        for i, num in enumerate(numbers, start=1):
-            payload[f"cek{i}"] = "1"
-            payload[f"tebak{i}"] = num
+
+    async def _submit_category(
+        self,
+        position: str,
+        category: str,
+        bet_per_number_idr: int,
+        dry_run: bool,
+    ) -> Optional[dict]:
+        """Submit satu kategori (50 angka) sebagai satu request bet."""
+        numbers = get_numbers_for_category(category)
+        bet_param = self._idr_to_bet_param(bet_per_number_idr)
+        total = bet_per_number_idr * len(numbers)
 
         logger.info(
-            "Betting: numbers=%s amount=Rp%s/number total=Rp%s dry_run=%s",
-            numbers, bet_amount_idr, bet_amount_idr * len(numbers), dry_run,
+            "Bet %s %s: %d angka × Rp%s = Rp%s total | dry_run=%s",
+            position, category, len(numbers), bet_per_number_idr, total, dry_run,
         )
+
+        payload: dict[str, str] = {
+            "type":   BET_TYPE,
+            "ganti":  "F",
+            "game":   GAME_TYPE,
+            "bet":    bet_param,
+            "posisi": _POSISI_MAP[position],
+            "sar":    POOL_ID,
+        }
+        for i, num in enumerate(numbers, start=1):
+            payload[f"cek{i}"]   = "1"
+            payload[f"tebak{i}"] = num
 
         if dry_run:
             return {
-                "status": "dry_run",
-                "numbers": numbers,
-                "bet_amount": bet_amount_idr,
-                "total": bet_amount_idr * len(numbers),
-                "payload": payload,
+                "status":   "dry_run",
+                "category": category,
+                "position": position,
+                "numbers":  numbers,
+                "total_idr": total,
             }
 
         client = await self._auth.get_client()
@@ -113,57 +135,96 @@ class Bettor:
                 },
             )
             raw = resp.text
-            logger.debug("Bet API raw response: %s", raw)
+            logger.debug("API response (%s %s): %s", position, category, raw[:300])
 
             try:
                 data = resp.json()
             except Exception:
                 data = {"raw": raw}
 
-            data["_numbers"] = numbers
-            data["_bet_amount"] = bet_amount_idr
+            data["_category"] = category
+            data["_position"] = position
+            data["_total_idr"] = total
 
-            success = data.get("status") in (1, "1", True, "true", "ok", "success")
-            if success:
+            if data.get("status") in (1, "1", True, "true", "ok", "success"):
                 logger.info(
-                    "Bet placed OK: periode=%s transaksi=%s balance=%s",
-                    data.get("periode"),
-                    data.get("transaksi"),
-                    data.get("balance"),
+                    "Bet OK — %s %s | periode=%s balance=%s",
+                    position, category, data.get("periode"), data.get("balance"),
                 )
             else:
-                logger.error("Bet placement failed: %s", data)
+                logger.error("Bet GAGAL — %s %s: %s", position, category, data)
 
             return data
 
         except Exception as e:
-            logger.error("Bet request failed: %s", e)
+            logger.error("Request gagal (%s %s): %s", position, category, e)
             return None
 
-    # ─── Win check ───────────────────────────────────────────────────────────
+    # ─── Win check ────────────────────────────────────────────────────────────
 
     @staticmethod
-    def check_win(numbers_bet: list[str], draw_result: str) -> tuple[bool, str | None]:
+    def check_category_win(
+        position: str,
+        bk_category: str,
+        gj_category: str,
+        result_4d: str,
+    ) -> dict:
         """
-        Check if any bet number matches the draw result.
+        Cek apakah hasil draw cocok dengan prediksi kategori.
 
-        For 2D belakang, we match the last 2 digits of the result.
-        Returns (won: bool, winning_number: str | None).
+        Returns:
+            {
+                "bk_win": bool,
+                "gj_win": bool,
+                "actual_bk": str,
+                "actual_gj": str,
+            }
         """
-        result_clean = str(draw_result).strip()
-        # Extract last 2 digits
-        digits = re.sub(r"\D", "", result_clean)
-        last_two = digits[-2:] if len(digits) >= 2 else digits.zfill(2)
+        parsed = parse_result(result_4d)
+        if not parsed or position not in parsed:
+            return {"bk_win": False, "gj_win": False, "actual_bk": "?", "actual_gj": "?"}
 
-        for num in numbers_bet:
-            if num == last_two:
-                return True, num
-        return False, None
+        pos_data   = parsed[position]
+        actual_bk  = pos_data["besar_kecil"]
+        actual_gj  = pos_data["genap_ganjil"]
+
+        return {
+            "bk_win":    actual_bk == bk_category,
+            "gj_win":    actual_gj == gj_category,
+            "actual_bk": actual_bk,
+            "actual_gj": actual_gj,
+        }
 
     @staticmethod
-    def calculate_payout(bet_amount_idr: int, num_numbers: int) -> int:
+    def calculate_category_payout(
+        bet_per_number_idr: int,
+        win_bk: bool,
+        win_gj: bool,
+        payout_multiplier: int = 100,
+    ) -> dict:
         """
-        Calculate potential payout for type=B (full) 2D bet.
-        Payout is x100 per winning number; total wagered = bet_amount * num_numbers.
+        Hitung payout dan total kerugian/keuntungan.
+
+        Setiap kategori: 50 nomor × bet_per_number.
+        Menang = 1 nomor cocok → payout × bet_per_number.
         """
-        return bet_amount_idr * 100  # per winning number
+        cost_per_cat  = bet_per_number_idr * 50
+        total_wagered = cost_per_cat * 2  # BK + GJ
+
+        won_bk = bet_per_number_idr * payout_multiplier if win_bk else 0
+        won_gj = bet_per_number_idr * payout_multiplier if win_gj else 0
+        total_won = won_bk + won_gj
+
+        return {
+            "total_wagered": total_wagered,
+            "total_won":     total_won,
+            "net":           total_won - total_wagered,
+            "win_bk":        win_bk,
+            "win_gj":        win_gj,
+        }
+
+    @staticmethod
+    def _idr_to_bet_param(amount_idr: int) -> str:
+        """Konversi IDR ke parameter bet (satuan ribu). Rp 100 → '0.1'"""
+        val = amount_idr / 1000
+        return str(int(val)) if val == int(val) else str(round(val, 3))

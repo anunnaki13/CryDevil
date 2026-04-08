@@ -73,18 +73,26 @@ LLM_TEMPERATURE     = _float("LLM_TEMPERATURE", 0.3)
 LLM_MAX_TOKENS      = 1000
 
 # ─── 4. Nominal bet ──────────────────────────────────────────────────────────
-BASE_BET    = _int("BASE_BET",   1_000)   # Rp/nomor di level 0
-NUM_PICKS   = _int("NUM_PICKS",  5)       # jumlah nomor per periode
+# BASE_BET = nominal per NOMOR (IDR). Setiap bet kategori = 50 nomor × BASE_BET
+# Contoh: BASE_BET=100 → 50 nomor × Rp100 = Rp5.000/kategori
+#         Menang: 1 nomor × 100x = Rp10.000, profit bersih Rp5.000/kategori
+BASE_BET    = _int("BASE_BET",   100)    # Rp/nomor di level 0 (min Rp 100)
 BET_TYPE    = _optional("BET_TYPE", "B") # B=full, D=diskon, A=bolak-balik
 MIN_BET     = 100
 MAX_BET_2D  = 2_000_000
 
+# Posisi yang diikutsertakan dalam bet (pilihan: depan, tengah, belakang)
+_pos_raw    = _optional("BET_POSITIONS", "belakang")
+BET_POSITIONS = [p.strip().lower() for p in _pos_raw.split(",") if p.strip()]
+
+# Untuk kompatibilitas modul lain
+NUM_PICKS   = len(BET_POSITIONS)  # 1 prediction object per posisi
+
 # ─── 5. Martingale ───────────────────────────────────────────────────────────
+# Level = nominal per NOMOR (IDR). Total per round = level × 50 × jumlah_posisi × 2
 MARTINGALE_LEVELS          = _int_list(
     "MARTINGALE_LEVELS",
-    [BASE_BET, int(BASE_BET * 1.5), int(BASE_BET * 2.5),
-     int(BASE_BET * 4),  int(BASE_BET * 6),
-     int(BASE_BET * 9),  int(BASE_BET * 13)],
+    [100, 150, 250, 400, 600, 900, 1300],  # per nomor; ×100 = total/kategori
 )
 MARTINGALE_LOSS_THRESHOLD  = _int("MARTINGALE_LOSS_THRESHOLD", 5)
 MAX_MARTINGALE_LEVEL       = len(MARTINGALE_LEVELS) - 1
@@ -200,7 +208,7 @@ def validate_config(exit_on_error: bool = True) -> bool:
         ok = False
 
     if ok:
-        # Print summary konfigurasi aktif
+        total_per_round = BASE_BET * 50 * 2 * len(BET_POSITIONS)
         print("\n" + "=" * 60)
         print("  KONFIGURASI AKTIF")
         print("=" * 60)
@@ -208,8 +216,11 @@ def validate_config(exit_on_error: bool = True) -> bool:
         print(f"  Pool ID      : {POOL_ID}")
         print(f"  Username     : {USERNAME}")
         print(f"  LLM Model    : {LLM_PRIMARY}")
-        print(f"  Bet/nomor    : Rp{BASE_BET:,}  |  {NUM_PICKS} nomor  |  Tipe: {BET_TYPE}")
-        print(f"  Total/round  : Rp{BASE_BET * NUM_PICKS:,}")
+        print(f"  Posisi bet   : {', '.join(BET_POSITIONS)}")
+        print(f"  Bet/nomor    : Rp{BASE_BET:,}  |  Tipe: {BET_TYPE}")
+        print(f"  Total/round  : Rp{total_per_round:,}  "
+              f"(50 nomor × 2 kategori × {len(BET_POSITIONS)} posisi × Rp{BASE_BET:,})")
+        print(f"  Potensi win  : Rp{BASE_BET * 100:,}/kategori (100x)")
         print(f"  Martingale   : {len(MARTINGALE_LEVELS)} level — " +
               " → ".join(f"Rp{x:,}" for x in MARTINGALE_LEVELS))
         print(f"  Naik level   : setiap {MARTINGALE_LOSS_THRESHOLD} kalah berturut-turut")

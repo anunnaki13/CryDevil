@@ -1,12 +1,19 @@
 """
 Hokidraw 2D Lottery Bot
 =======================
-Automatically predicts and places 2D bets on the Hokidraw market (partai34848.com)
-using OpenRouter LLM for number selection and soft martingale money management.
+Otomatis prediksi dan pasang bet Besar/Kecil + Genap/Ganjil
+pada pasar Hokidraw (partai34848.com).
+
+Cara main:
+  - Setiap periode, LLM menganalisis history dan memprediksi kategori BK/GJ
+    untuk posisi yang dikonfigurasi (depan/tengah/belakang).
+  - Bot memasang 50 angka per kategori (2 bet per posisi: BK + GJ).
+  - Menang jika hasil draw masuk kategori yang diprediksi (win rate ~50%).
 
 Usage:
-    python main.py              # live mode
-    python main.py --dry-run    # dry-run (no real bets placed)
+    python main.py                # live mode
+    python main.py --dry-run      # test tanpa bet sungguhan
+    python main.py --check-config # cek .env saja lalu keluar
 """
 
 import asyncio
@@ -23,7 +30,8 @@ from apscheduler.triggers.cron import CronTrigger
 from config import (
     POLL_INTERVAL_SECONDS, MAX_POLL_ATTEMPTS,
     BET_START_MINUTE, BET_STOP_MINUTE,
-    DAILY_LOSS_LIMIT, LOG_PATH, DB_PATH,
+    DAILY_LOSS_LIMIT, LOG_PATH,
+    BET_POSITIONS,
     validate_config,
 )
 from modules import database as db
@@ -33,6 +41,7 @@ from modules.predictor import Predictor
 from modules.bettor import Bettor
 from modules.money_manager import MoneyManager
 from modules.notifier import TelegramNotifier
+from modules.categories import parse_result, result_summary
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
@@ -48,7 +57,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("hokidraw.main")
 
-# ─── WIB timezone ─────────────────────────────────────────────────────────────
 _WIB = timezone(timedelta(hours=7))
 
 
@@ -56,215 +64,245 @@ def _now_wib() -> datetime:
     return datetime.now(_WIB)
 
 
-# ─── Bot state ────────────────────────────────────────────────────────────────
+# ─── Bot ─────────────────────────────────────────────────────────────────────
 
 class HokidrawBot:
     def __init__(self, dry_run: bool = False) -> None:
-        self.dry_run = dry_run
-        self.auth = AuthManager()
-        self.scraper = Scraper(self.auth)
-        self.predictor = Predictor()
-        self.bettor = Bettor(self.auth)
+        self.dry_run       = dry_run
+        self.auth          = AuthManager()
+        self.scraper       = Scraper(self.auth)
+        self.predictor     = Predictor()
+        self.bettor        = Bettor(self.auth)
         self.money_manager = MoneyManager()
-        self.notifier = TelegramNotifier()
-        self._last_handled_periode: Optional[str] = None
+        self.notifier      = TelegramNotifier()
+        self._last_periode: Optional[str] = None
 
-    # ─── Betting cycle ───────────────────────────────────────────────────────
+    # ─── Siklus utama ─────────────────────────────────────────────────────────
 
     async def run_betting_cycle(self) -> None:
-        """Full hourly betting cycle: result → predict → bet."""
         now = _now_wib()
-        logger.info("=== Betting cycle start @ %s ===", now.strftime("%H:%M WIB"))
+        logger.info("=== Siklus bet mulai @ %s ===", now.strftime("%H:%M WIB"))
 
-        # Check daily loss limit before doing anything
+        # 1. Cek limit harian
         if not await self.money_manager.check_and_enforce_daily_limit():
             await self.notifier.send_limit_reached(
                 await self.money_manager.get_daily_loss(), DAILY_LOSS_LIMIT
             )
             return
 
-        # Ensure we are logged in
+        # 2. Pastikan login aktif
         if not await self.auth.ensure_logged_in():
-            await self.notifier.send_alert("Login failed — skipping cycle")
+            await self.notifier.send_alert("Login gagal — skip siklus ini")
             return
 
-        # ── Step 1: Poll for latest draw result ──────────────────────────────
+        # 3. Tunggu result baru
         new_result = await self._wait_for_new_result()
         if new_result is None:
-            logger.warning("No new result detected after %s attempts", MAX_POLL_ATTEMPTS)
+            logger.warning("Tidak ada result baru setelah %s polling", MAX_POLL_ATTEMPTS)
             return
 
-        # ── Step 2: Check pending bets against new result ────────────────────
+        # 4. Settle pending bet dengan result baru
         await self._settle_pending_bets(new_result)
 
-        # ── Step 3: Check daily limit again (post-settle) ────────────────────
+        # 5. Cek limit lagi setelah settle
         if not await self.money_manager.check_and_enforce_daily_limit():
             await self.notifier.send_limit_reached(
                 await self.money_manager.get_daily_loss(), DAILY_LOSS_LIMIT
             )
             return
 
-        # ── Step 4: Check if we're in the betting window ─────────────────────
-        minute = now.minute
-        if not (BET_START_MINUTE <= minute <= BET_STOP_MINUTE):
-            logger.info("Outside betting window (:%02d) — skipping bet", minute)
+        # 6. Cek window waktu betting
+        if not (BET_START_MINUTE <= now.minute <= BET_STOP_MINUTE):
+            logger.info("Di luar window bet (menit :%02d) — skip", now.minute)
             return
 
-        # ── Step 5: Fetch history and predict ────────────────────────────────
+        # 7. Ambil history dan prediksi
         history = await self.scraper.get_draw_history()
         if not history:
-            await self.notifier.send_alert("Failed to fetch draw history")
+            await self.notifier.send_alert("Gagal ambil history draw")
             return
 
         prediction = await self.predictor.predict(history)
         if prediction is None:
-            await self.notifier.send_alert("LLM prediction failed")
+            await self.notifier.send_alert("LLM prediction gagal")
             return
 
-        picks = prediction["picks"]
-        numbers = [p["number"] for p in picks]
-        analysis = prediction.get("analysis", "")
-        logger.info("Predicted numbers: %s", numbers)
-        logger.info("Analysis: %s", analysis)
-
-        # ── Step 6: Get bet amount from money manager ─────────────────────────
-        bet_per_number = await self.money_manager.get_bet_amount()
-        total_bet = bet_per_number * len(numbers)
-        martingale_level = await self.money_manager.get_martingale_level()
-
-        # ── Step 7: Get current periode ───────────────────────────────────────
+        # 8. Ambil periode saat ini
         periode = await self.scraper.get_current_periode()
         if not periode:
-            await self.notifier.send_alert("Failed to get current periode")
+            await self.notifier.send_alert("Gagal ambil periode saat ini")
             return
 
-        # Avoid re-betting on the same periode
-        if periode == self._last_handled_periode:
-            logger.info("Already bet on periode %s — skipping", periode)
+        if periode == self._last_periode:
+            logger.info("Sudah bet di periode %s — skip", periode)
             return
 
-        # ── Step 8: Place bets ────────────────────────────────────────────────
-        response = await self.bettor.place_bets(numbers, bet_per_number, dry_run=self.dry_run)
-        if response is None:
-            await self.notifier.send_alert(f"Bet placement failed for periode {periode}")
-            return
+        # 9. Pasang bet per posisi
+        bet_per_number  = await self.money_manager.get_bet_amount()
+        martingale_level = await self.money_manager.get_martingale_level()
+        analysis         = prediction.get("analysis", "")
 
-        success = (
-            self.dry_run
-            or response.get("status") in (1, "1", True, "true", "ok", "success")
+        for pred in prediction["predictions"]:
+            pos = pred["position"]
+            if pos not in BET_POSITIONS:
+                continue
+
+            await self._place_one_bet(
+                periode, pos, pred, bet_per_number, martingale_level, analysis
+            )
+
+        self._last_periode = periode
+
+    # ─── Pasang satu bet (satu posisi) ────────────────────────────────────────
+
+    async def _place_one_bet(
+        self,
+        periode: str,
+        position: str,
+        pred: dict,
+        bet_per_number: int,
+        martingale_level: int,
+        analysis: str,
+    ) -> None:
+        bk = pred["besar_kecil"]
+        gj = pred["genap_ganjil"]
+        bk_conf = pred["bk_confidence"]
+        gj_conf = pred["gj_confidence"]
+
+        logger.info(
+            "Prediksi %s: BK=%s(%.0f%%) GJ=%s(%.0f%%)",
+            position, bk, bk_conf*100, gj, gj_conf*100,
         )
 
-        if success:
-            self._last_handled_periode = periode
-            # Save to DB
+        response = await self.bettor.place_category_bet(
+            position, bk, gj, bet_per_number, dry_run=self.dry_run
+        )
+        if response is None:
+            await self.notifier.send_alert(f"Bet gagal — {position} periode {periode}")
+            return
+
+        # Cek sukses (dry_run atau API OK)
+        bk_resp = response.get("bk", {}) or {}
+        gj_resp = response.get("gj", {}) or {}
+        bk_ok = self.dry_run or bk_resp.get("status") in (1, "1", True, "true", "ok", "success")
+        gj_ok = self.dry_run or gj_resp.get("status") in (1, "1", True, "true", "ok", "success")
+
+        if bk_ok and gj_ok:
             bet_id = await db.save_bet(
                 periode=periode,
-                numbers=numbers,
+                numbers=[f"{position}|{bk}", f"{position}|{gj}"],
                 bet_amount=bet_per_number,
                 martingale_level=martingale_level,
                 raw_response=str(response),
             )
-            logger.info("Bet saved to DB: id=%s periode=%s", bet_id, periode)
+            logger.info("Bet tersimpan: id=%s posisi=%s", bet_id, position)
 
             await self.notifier.send_bet_placed(
                 periode=periode,
-                numbers=numbers,
+                position=position,
+                bk_category=bk,
+                gj_category=gj,
+                bk_confidence=bk_conf,
+                gj_confidence=gj_conf,
                 bet_per_number=bet_per_number,
-                total_bet=total_bet,
                 martingale_level=martingale_level,
                 analysis=analysis,
                 dry_run=self.dry_run,
             )
         else:
             await self.notifier.send_alert(
-                f"Bet rejected for periode {periode}: {response}"
+                f"Bet ditolak — {position} periode {periode}\n"
+                f"BK: {bk_resp}\nGJ: {gj_resp}"
             )
 
-    # ─── New result polling ───────────────────────────────────────────────────
+    # ─── Polling result baru ──────────────────────────────────────────────────
 
     async def _wait_for_new_result(self) -> Optional[dict]:
-        """
-        Poll for a new draw result that hasn't been seen yet.
-        Returns the result dict or None after MAX_POLL_ATTEMPTS.
-        """
-        last_known = await db.get_last_result()
+        last_known   = await db.get_last_result()
         last_periode = last_known["periode"] if last_known else None
 
         for attempt in range(1, MAX_POLL_ATTEMPTS + 1):
             latest = await self.scraper.get_latest_result()
             if latest and latest["periode"] != last_periode:
-                # New result found
                 inserted = await db.save_result(
                     latest["periode"],
                     latest["result"],
                     latest["draw_time"],
                 )
                 if inserted:
-                    logger.info(
-                        "New result: periode=%s result=%s",
-                        latest["periode"], latest["result"],
-                    )
+                    parsed = parse_result(latest["result"])
+                    summary = result_summary(parsed) if parsed else latest["result"]
+                    logger.info("Result baru: %s", summary)
                 return latest
 
             if attempt < MAX_POLL_ATTEMPTS:
-                logger.debug("No new result yet (attempt %s/%s), waiting %ss",
+                logger.debug("Belum ada result baru (%d/%d), tunggu %ds",
                              attempt, MAX_POLL_ATTEMPTS, POLL_INTERVAL_SECONDS)
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
         return None
 
-    # ─── Bet settlement ───────────────────────────────────────────────────────
+    # ─── Settle pending bets ──────────────────────────────────────────────────
 
     async def _settle_pending_bets(self, new_result: dict) -> None:
-        """Check all pending bets against the new draw result."""
         pending = await db.get_pending_bets()
         if not pending:
             return
 
-        result_str = new_result["result"]
-        for bet in pending:
-            numbers = bet["numbers"].split(",")
-            won, winning_num = self.bettor.check_win(numbers, result_str)
-            bet_amount = bet["bet_amount"]
-            total_wagered = bet_amount * len(numbers)
+        result_4d = new_result["result"]
 
-            if won:
-                payout = self.bettor.calculate_payout(bet_amount, len(numbers))
-                await db.update_bet_result(bet["id"], "won", payout)
-                await self.money_manager.record_win(total_wagered, payout)
-                daily_loss = await self.money_manager.get_daily_loss()
-                await self.notifier.send_result(
-                    periode=bet["periode"],
-                    draw_result=result_str,
-                    won=True,
-                    winning_number=winning_num,
-                    win_amount=payout,
-                    wagered=total_wagered,
-                    consecutive_losses=0,
-                    daily_loss=daily_loss,
+        for bet in pending:
+            # numbers field: ["belakang|besar", "belakang|ganjil"]
+            numbers = bet["numbers"].split(",")
+            if len(numbers) < 2:
+                continue
+
+            position  = numbers[0].split("|")[0]
+            pred_bk   = numbers[0].split("|")[1]
+            pred_gj   = numbers[1].split("|")[1]
+            bet_per_n = bet["bet_amount"]
+
+            win_data = self.bettor.check_category_win(position, pred_bk, pred_gj, result_4d)
+            payout   = self.bettor.calculate_category_payout(
+                bet_per_n,
+                win_data["bk_win"],
+                win_data["gj_win"],
+            )
+
+            status = "won" if (win_data["bk_win"] or win_data["gj_win"]) else "lost"
+            await db.update_bet_result(bet["id"], status, payout["total_won"])
+
+            if payout["total_won"] > 0:
+                await self.money_manager.record_win(
+                    payout["total_wagered"], payout["total_won"]
                 )
             else:
-                await db.update_bet_result(bet["id"], "lost", 0)
-                await self.money_manager.record_loss(total_wagered)
-                consecutive = await self.money_manager.get_consecutive_losses()
-                daily_loss = await self.money_manager.get_daily_loss()
-                await self.notifier.send_result(
-                    periode=bet["periode"],
-                    draw_result=result_str,
-                    won=False,
-                    winning_number=None,
-                    win_amount=0,
-                    wagered=total_wagered,
-                    consecutive_losses=consecutive,
-                    daily_loss=daily_loss,
-                )
+                await self.money_manager.record_loss(payout["total_wagered"])
+
+            consecutive = await self.money_manager.get_consecutive_losses()
+            daily_loss  = await self.money_manager.get_daily_loss()
+
+            await self.notifier.send_result(
+                periode=bet["periode"],
+                draw_result_4d=result_4d,
+                position=position,
+                predicted_bk=pred_bk,
+                predicted_gj=pred_gj,
+                actual_bk=win_data["actual_bk"],
+                actual_gj=win_data["actual_gj"],
+                win_bk=win_data["bk_win"],
+                win_gj=win_data["gj_win"],
+                total_wagered=payout["total_wagered"],
+                total_won=payout["total_won"],
+                consecutive_losses=consecutive,
+                daily_loss=daily_loss,
+            )
 
     # ─── Daily summary ────────────────────────────────────────────────────────
 
     async def run_daily_summary(self) -> None:
-        """Send daily summary at 23:55 WIB."""
-        today = _now_wib().strftime("%Y-%m-%d")
-        stats = await db.get_daily_stats(today)
+        today   = _now_wib().strftime("%Y-%m-%d")
+        stats   = await db.get_daily_stats(today)
         balance = await self.auth.get_balance()
 
         if stats:
@@ -278,19 +316,19 @@ class HokidrawBot:
                 final_balance=balance,
             )
         else:
-            await self.notifier.send_info(f"No bets placed today ({today})")
+            await self.notifier.send_info(f"Tidak ada bet hari ini ({today})")
 
         await self.money_manager.midnight_reset()
 
-    # ─── Startup ─────────────────────────────────────────────────────────────
+    # ─── Startup / Shutdown ───────────────────────────────────────────────────
 
     async def startup(self) -> None:
         await db.init_db()
         if not await self.auth.login():
-            logger.error("Initial login failed — check credentials")
+            logger.error("Login awal gagal — cek kredensial di .env")
             sys.exit(1)
         balance = await self.auth.get_balance()
-        logger.info("Logged in. Balance: Rp%s", f"{balance:,}" if balance else "unknown")
+        logger.info("Login berhasil. Balance: Rp%s", f"{balance:,}" if balance else "?")
         await self.notifier.send_startup(dry_run=self.dry_run)
 
     async def shutdown(self) -> None:
@@ -298,7 +336,7 @@ class HokidrawBot:
         await self.auth.close()
 
 
-# ─── Scheduler setup ──────────────────────────────────────────────────────────
+# ─── Scheduler ───────────────────────────────────────────────────────────────
 
 async def run(dry_run: bool) -> None:
     bot = HokidrawBot(dry_run=dry_run)
@@ -306,7 +344,6 @@ async def run(dry_run: bool) -> None:
 
     scheduler = AsyncIOScheduler(timezone="Asia/Jakarta")
 
-    # Main cycle: every hour at minute :05
     scheduler.add_job(
         bot.run_betting_cycle,
         CronTrigger(minute=BET_START_MINUTE, timezone="Asia/Jakarta"),
@@ -316,7 +353,6 @@ async def run(dry_run: bool) -> None:
         misfire_grace_time=120,
     )
 
-    # Daily summary at 23:55 WIB
     scheduler.add_job(
         bot.run_daily_summary,
         CronTrigger(hour=23, minute=55, timezone="Asia/Jakarta"),
@@ -326,7 +362,7 @@ async def run(dry_run: bool) -> None:
 
     scheduler.start()
     logger.info(
-        "Scheduler started. Betting cycle fires at :%02d each hour. Dry run: %s",
+        "Scheduler aktif. Siklus bet setiap jam di menit :%02d. Dry run: %s",
         BET_START_MINUTE, dry_run,
     )
 
@@ -334,36 +370,29 @@ async def run(dry_run: bool) -> None:
         while True:
             await asyncio.sleep(60)
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Shutting down...")
+        logger.info("Shutdown...")
     finally:
         scheduler.shutdown(wait=False)
         await bot.shutdown()
 
 
-# ─── Entry point ──────────────────────────────────────────────────────────────
+# ─── Entry point ─────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Hokidraw 2D Lottery Bot")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Log semua aksi tanpa benar-benar pasang bet",
-    )
-    parser.add_argument(
-        "--check-config",
-        action="store_true",
-        help="Cek konfigurasi .env saja lalu keluar",
-    )
+    parser.add_argument("--dry-run",      action="store_true",
+                        help="Test tanpa bet sungguhan")
+    parser.add_argument("--check-config", action="store_true",
+                        help="Cek konfigurasi .env saja lalu keluar")
     args = parser.parse_args()
 
-    # Validasi konfigurasi — wajib sebelum apapun
     validate_config(exit_on_error=not args.check_config)
 
     if args.check_config:
         sys.exit(0)
 
     if args.dry_run:
-        logger.info("*** DRY RUN MODE — tidak ada bet sungguhan yang dipasang ***")
+        logger.info("*** DRY RUN MODE — tidak ada bet sungguhan ***")
 
     asyncio.run(run(dry_run=args.dry_run))
 

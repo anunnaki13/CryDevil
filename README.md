@@ -5,9 +5,43 @@ Menggunakan **OpenRouter LLM** untuk prediksi nomor dan **Telegram** untuk notif
 
 ---
 
+## Cara Main (Mekanisme 2D)
+
+Setiap hasil draw Hokidraw adalah 4 digit, dibagi 3 pasangan posisi:
+
+```
+Contoh hasil: 1 2 9 5
+              ├─┤ ├─┤ ← Depan=12, Tengah=29, Belakang=95
+                  ├─┤ ← Tengah=29
+                  └─┤ ← Belakang=95 (overlap Tengah)
+```
+
+Setiap pasangan diklasifikasikan:
+
+| Pasangan | Besar/Kecil (digit pertama) | Genap/Ganjil (digit kedua) |
+|---|---|---|
+| `12` | **Kecil** (1 < 5) | **Genap** (2 → 0,2,4,6,8) |
+| `29` | **Kecil** (2 < 5) | **Ganjil** (9 → 1,3,5,7,9) |
+| `95` | **Besar** (9 ≥ 5) | **Ganjil** (5 → 1,3,5,7,9) |
+
+Bot memprediksi kategori untuk draw berikutnya dan memasang:
+- **Besar/Kecil** → 50 angka yang memenuhi kategori
+- **Genap/Ganjil** → 50 angka yang memenuhi kategori
+
+**Ekonomi bet** (BASE_BET=100):
+| | Jumlah Nomor | Taruhan | Potensi Win | Profit Bersih |
+|---|---|---|---|---|
+| Besar atau Kecil | 50 | Rp 5.000 | Rp 10.000 | Rp 5.000 |
+| Genap atau Ganjil | 50 | Rp 5.000 | Rp 10.000 | Rp 5.000 |
+| **Total/periode** | 100 | **Rp 10.000** | maks Rp 20.000 | maks Rp 10.000 |
+
+---
+
 ## Fitur Utama
 
 - **Prediksi LLM** — analisis 200 hasil terakhir via OpenRouter (Gemini / Claude)
+- **Betting BK/GJ** — Besar/Kecil + Genap/Ganjil, bukan tebak angka spesifik
+- **Multi-posisi** — bisa bet Depan, Tengah, Belakang, atau kombinasinya
 - **Soft Martingale** — 7 level, naik otomatis setelah N kekalahan berturut-turut
 - **Daily Loss Limit** — bot berhenti otomatis jika rugi harian melebihi batas
 - **Notifikasi Telegram** — setiap bet, hasil menang/kalah, dan summary harian
@@ -30,8 +64,9 @@ barbatos/
 ├── modules/
 │   ├── auth.py              # Login, CSRF, validasi sesi, Playwright fallback
 │   ├── scraper.py           # Ambil history draw, periode, timer
-│   ├── predictor.py         # Prediksi nomor via OpenRouter LLM
-│   ├── bettor.py            # Submit bet, cek menang, hitung payout
+│   ├── categories.py        # Parser BK/GJ dari hasil 4D + generator angka
+│   ├── predictor.py         # Prediksi BK/GJ via OpenRouter LLM
+│   ├── bettor.py            # Submit bet 50 angka per kategori, cek menang
 │   ├── money_manager.py     # Martingale & daily loss limit
 │   ├── notifier.py          # Notifikasi Telegram
 │   └── database.py          # SQLite (results, bets, daily_stats, bot_state)
@@ -91,15 +126,15 @@ nano /opt/hokidraw-bot/.env
 
 | Setting | Default | Keterangan |
 |---|---|---|
-| `BASE_BET` | `1000` | Nominal bet per nomor (Rupiah) di level 0 |
-| `NUM_PICKS` | `5` | Jumlah nomor yang dipasang per periode |
-| `BET_TYPE` | `B` | `B`=full, `D`=diskon, `A`=bolak-balik |
+| `BASE_BET` | `100` | Nominal bet **per nomor** (Rupiah). Total/round = BASE_BET × 50 × 2 × jumlah posisi |
+| `BET_POSITIONS` | `belakang` | Posisi yang dibet. Pilihan: `depan`, `tengah`, `belakang`, atau kombinasi pisah koma |
+| `BET_TYPE` | `B` | `B`=full (payout 100x), `D`=diskon |
 
 ### Martingale
 
 | Setting | Default | Keterangan |
 |---|---|---|
-| `MARTINGALE_LEVELS` | `1000,1500,2500,4000,6000,9000,13000` | Nominal per nomor tiap level (pisah koma) |
+| `MARTINGALE_LEVELS` | `100,150,250,400,600,900,1300` | Nominal **per nomor** tiap level (pisah koma). Total/round = level × 50 × 2 × posisi |
 | `MARTINGALE_LOSS_THRESHOLD` | `5` | Naik 1 level setiap berapa kekalahan berturut-turut |
 | `DAILY_LOSS_LIMIT` | `200000` | Batas rugi harian (Rp) sebelum bot berhenti |
 
