@@ -1,0 +1,28 @@
+# Credentials — jangan pernah di-commit!
+.env
+
+# Database & logs — dibuat saat runtime
+data/*.db
+logs/*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

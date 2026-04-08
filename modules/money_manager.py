@@ -1,18 +1,25 @@
-"""Money management with soft martingale and daily loss limit."""
+"""
+Money management — Soft Martingale dengan tracking TERPISAH untuk BK dan GJ.
+
+Setiap dimensi (besar_kecil dan genap_ganjil) punya:
+  - consecutive_losses sendiri
+  - martingale_level sendiri
+
+Win → reset level dimensi itu ke 0.
+Loss → increment counter; naik level tiap MARTINGALE_STEP_LOSSES kalah berturut.
+"""
 
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional
 
 from config import (
-    MARTINGALE_LEVELS, MARTINGALE_LOSS_THRESHOLD,
-    MAX_MARTINGALE_LEVEL, DAILY_LOSS_LIMIT, NUM_PICKS,
+    MARTINGALE_LEVELS, MARTINGALE_STEP_LOSSES,
+    MAX_MARTINGALE_LEVEL, DAILY_LOSS_LIMIT,
 )
 from modules import database as db
 
 logger = logging.getLogger(__name__)
 
-# WIB = UTC+7
 _WIB = timezone(timedelta(hours=7))
 
 
@@ -20,134 +27,135 @@ def _today_wib() -> str:
     return datetime.now(_WIB).strftime("%Y-%m-%d")
 
 
+# Kunci state di DB per dimensi
+_KEYS = {
+    "besar_kecil":  ("consecutive_losses_bk", "martingale_level_bk"),
+    "genap_ganjil": ("consecutive_losses_gj", "martingale_level_gj"),
+}
+
+
 class MoneyManager:
-    """Tracks consecutive losses, manages martingale levels, enforces daily loss limit."""
 
-    # ─── State accessors ─────────────────────────────────────────────────────
+    # ─── Level & bet amount ───────────────────────────────────────────────────
 
-    async def get_consecutive_losses(self) -> int:
-        val = await db.get_state("consecutive_losses", "0")
-        return int(val)
+    async def get_level(self, dimension: str) -> int:
+        _, level_key = _KEYS[dimension]
+        return int(await db.get_state(level_key, "0"))
 
-    async def set_consecutive_losses(self, count: int) -> None:
-        await db.set_state("consecutive_losses", str(count))
+    async def set_level(self, dimension: str, level: int) -> None:
+        _, level_key = _KEYS[dimension]
+        await db.set_state(level_key, str(min(level, MAX_MARTINGALE_LEVEL)))
 
-    async def get_martingale_level(self) -> int:
-        val = await db.get_state("martingale_level", "0")
-        return int(val)
+    async def get_bet_amount(self, dimension: str) -> int:
+        """Return nominal bet per ANGKA (IDR) untuk dimensi ini."""
+        level = await self.get_level(dimension)
+        return MARTINGALE_LEVELS[level]
 
-    async def set_martingale_level(self, level: int) -> None:
-        level = min(level, MAX_MARTINGALE_LEVEL)
-        await db.set_state("martingale_level", str(level))
+    async def get_consecutive_losses(self, dimension: str) -> int:
+        loss_key, _ = _KEYS[dimension]
+        return int(await db.get_state(loss_key, "0"))
+
+    async def set_consecutive_losses(self, dimension: str, count: int) -> None:
+        loss_key, _ = _KEYS[dimension]
+        await db.set_state(loss_key, str(count))
+
+    # ─── Daily loss ───────────────────────────────────────────────────────────
 
     async def get_daily_loss(self) -> int:
-        val = await db.get_state("daily_loss", "0")
-        return int(val)
+        return int(await db.get_state("daily_loss", "0"))
 
     async def add_daily_loss(self, amount: int) -> int:
         current = await self.get_daily_loss()
-        new_total = current + amount
-        await db.set_state("daily_loss", str(new_total))
-        return new_total
+        new_val = current + amount
+        await db.set_state("daily_loss", str(new_val))
+        return new_val
 
     async def reset_daily_loss(self) -> None:
         await db.set_state("daily_loss", "0")
-        logger.info("Daily loss counter reset")
-
-    # ─── Bet amount ──────────────────────────────────────────────────────────
-
-    async def get_bet_amount(self) -> int:
-        """Return bet amount per number for current martingale level."""
-        level = await self.get_martingale_level()
-        return MARTINGALE_LEVELS[level]
-
-    async def get_total_bet(self, num_numbers: int = NUM_PICKS) -> int:
-        """Return total bet amount for current martingale level."""
-        return (await self.get_bet_amount()) * num_numbers
-
-    # ─── Daily loss limit ─────────────────────────────────────────────────────
 
     async def is_daily_limit_reached(self) -> bool:
-        daily_loss = await self.get_daily_loss()
-        return daily_loss >= DAILY_LOSS_LIMIT
+        return (await self.get_daily_loss()) >= DAILY_LOSS_LIMIT
 
     async def check_and_enforce_daily_limit(self) -> bool:
-        """Returns True if betting should continue, False if limit hit."""
+        """Return True jika masih bisa bet, False jika limit tercapai."""
         if await self.is_daily_limit_reached():
             loss = await self.get_daily_loss()
             logger.warning(
-                "Daily loss limit reached: Rp%s / Rp%s — pausing until midnight WIB",
+                "Daily loss limit tercapai: Rp%s / Rp%s — pause sampai tengah malam WIB",
                 loss, DAILY_LOSS_LIMIT,
             )
             return False
         return True
 
-    # ─── Result recording ─────────────────────────────────────────────────────
+    # ─── Record hasil ─────────────────────────────────────────────────────────
 
-    async def record_loss(self, wagered: int) -> None:
-        """Update state after a losing round."""
-        losses = await self.get_consecutive_losses()
-        losses += 1
-        await self.set_consecutive_losses(losses)
+    async def record_win(self, dimension: str, wagered: int, won: int) -> None:
+        """Catat menang — reset level dimensi ini."""
+        await self.set_consecutive_losses(dimension, 0)
+        await self.set_level(dimension, 0)
+        logger.info(
+            "%s WIN: wagered=Rp%s won=Rp%s net=+Rp%s → level reset ke 0",
+            dimension.upper(), wagered, won, won - wagered,
+        )
+        today = _today_wib()
+        await db.update_daily_stats(today, wagered, won, is_win=True)
 
-        # Add to daily loss
+    async def record_loss(self, dimension: str, wagered: int) -> None:
+        """Catat kalah — update streak dan level martingale jika perlu."""
+        losses = await self.get_consecutive_losses(dimension) + 1
+        await self.set_consecutive_losses(dimension, losses)
+
         daily = await self.add_daily_loss(wagered)
         logger.info(
-            "Loss recorded: consecutive=%s daily_loss=Rp%s/Rp%s",
-            losses, daily, DAILY_LOSS_LIMIT,
+            "%s LOSS: consecutive=%s daily_loss=Rp%s/Rp%s",
+            dimension.upper(), losses, daily, DAILY_LOSS_LIMIT,
         )
 
-        # Level up martingale if threshold reached
-        if losses > 0 and losses % MARTINGALE_LOSS_THRESHOLD == 0:
-            current_level = await self.get_martingale_level()
-            if current_level < MAX_MARTINGALE_LEVEL:
-                new_level = current_level + 1
-                await self.set_martingale_level(new_level)
+        # Naik level setiap MARTINGALE_STEP_LOSSES kalah berturut
+        if losses % MARTINGALE_STEP_LOSSES == 0:
+            current = await self.get_level(dimension)
+            if current < MAX_MARTINGALE_LEVEL:
+                new_level = current + 1
+                await self.set_level(dimension, new_level)
                 logger.info(
-                    "Martingale level up: %s → %s (bet per number: Rp%s)",
-                    current_level, new_level, MARTINGALE_LEVELS[new_level],
+                    "%s level naik: %s → %s (Rp%s/angka)",
+                    dimension.upper(), current, new_level, MARTINGALE_LEVELS[new_level],
                 )
             else:
                 logger.warning(
-                    "Already at max martingale level %s (Rp%s/number)",
-                    MAX_MARTINGALE_LEVEL, MARTINGALE_LEVELS[MAX_MARTINGALE_LEVEL],
+                    "%s sudah di level maksimum %s (Rp%s/angka)",
+                    dimension.upper(), MAX_MARTINGALE_LEVEL,
+                    MARTINGALE_LEVELS[MAX_MARTINGALE_LEVEL],
                 )
 
-        # Update daily stats
         today = _today_wib()
         await db.update_daily_stats(today, wagered, 0, is_win=False)
-
-    async def record_win(self, wagered: int, won: int) -> None:
-        """Update state after a winning round — reset consecutive losses."""
-        await self.set_consecutive_losses(0)
-        await self.set_martingale_level(0)
-        logger.info("Win recorded: won=Rp%s wagered=Rp%s — martingale reset", won, wagered)
-
-        today = _today_wib()
-        await db.update_daily_stats(today, wagered, won, is_win=True)
 
     # ─── Daily reset ─────────────────────────────────────────────────────────
 
     async def midnight_reset(self) -> None:
-        """Reset daily counters at midnight WIB."""
+        """Reset semua counter harian di tengah malam WIB."""
         await self.reset_daily_loss()
-        logger.info("Midnight reset: daily loss cleared")
+        logger.info("Midnight reset: daily_loss direset")
 
     # ─── Summary ─────────────────────────────────────────────────────────────
 
     async def get_status_summary(self) -> dict:
-        level = await self.get_martingale_level()
-        losses = await self.get_consecutive_losses()
-        daily_loss = await self.get_daily_loss()
-        bet_amount = MARTINGALE_LEVELS[level]
+        bk_level  = await self.get_level("besar_kecil")
+        gj_level  = await self.get_level("genap_ganjil")
+        bk_losses = await self.get_consecutive_losses("besar_kecil")
+        gj_losses = await self.get_consecutive_losses("genap_ganjil")
+        daily     = await self.get_daily_loss()
 
         return {
-            "martingale_level": level,
-            "consecutive_losses": losses,
-            "bet_per_number": bet_amount,
-            "total_bet_per_round": bet_amount * NUM_PICKS,
-            "daily_loss": daily_loss,
+            "bk_level":   bk_level,
+            "gj_level":   gj_level,
+            "bk_losses":  bk_losses,
+            "gj_losses":  gj_losses,
+            "bk_bet":     MARTINGALE_LEVELS[bk_level],
+            "gj_bet":     MARTINGALE_LEVELS[gj_level],
+            "daily_loss": daily,
             "daily_limit": DAILY_LOSS_LIMIT,
-            "daily_limit_remaining": max(0, DAILY_LOSS_LIMIT - daily_loss),
-            "limit_reached": daily_loss >= DAILY_LOSS_LIMIT,
+            "limit_sisa": max(0, DAILY_LOSS_LIMIT - daily),
+            "limit_hit":  daily >= DAILY_LOSS_LIMIT,
         }

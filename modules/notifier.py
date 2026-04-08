@@ -1,4 +1,4 @@
-"""Telegram notification module."""
+"""Telegram notification module — format pesan sesuai blueprint."""
 
 import logging
 from typing import Optional
@@ -15,11 +15,11 @@ logger = logging.getLogger(__name__)
 class TelegramNotifier:
     def __init__(self) -> None:
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-            self._bot = Bot(token=TELEGRAM_BOT_TOKEN)
+            self._bot     = Bot(token=TELEGRAM_BOT_TOKEN)
             self._chat_id = TELEGRAM_CHAT_ID
             self._enabled = True
         else:
-            self._bot = None
+            self._bot     = None
             self._chat_id = None
             self._enabled = False
             logger.warning("Telegram tidak dikonfigurasi — notifikasi dinonaktifkan")
@@ -39,109 +39,106 @@ class TelegramNotifier:
 
     # ─── Bet placed ──────────────────────────────────────────────────────────
 
-    async def send_bet_placed(
+    async def notify_bet_placed(
         self,
         periode: str,
-        position: str,
-        bk_category: str,
-        gj_category: str,
+        bk_choice: str,        # "BE" | "KE"
+        gj_choice: str,        # "GE" | "GA"
         bk_confidence: float,
         gj_confidence: float,
-        bet_per_number: int,
-        martingale_level: int,
-        analysis: str = "",
+        bet_amount: int,       # per angka (IDR)
+        bk_level: int,
+        gj_level: int,
         dry_run: bool = False,
     ) -> None:
-        mode = "[DRY RUN] " if dry_run else ""
-        total = bet_per_number * 50 * 2
+        mode       = "[DRY RUN] " if dry_run else ""
+        total      = bet_amount * 50 * 2
+        bk_labels  = {"BE": "BESAR", "KE": "KECIL"}
+        gj_labels  = {"GE": "GENAP", "GA": "GANJIL"}
+
         text = (
-            f"{mode}🎯 <b>Bet Dipasang — Periode {periode}</b>\n"
-            f"Posisi: <b>{position.upper()}</b>\n"
-            f"  Besar/Kecil : <b>{bk_category.upper()}</b> "
-            f"(confidence {bk_confidence:.0%}) × 50 nomor\n"
-            f"  Genap/Ganjil: <b>{gj_category.upper()}</b> "
-            f"(confidence {gj_confidence:.0%}) × 50 nomor\n"
-            f"Taruhan: Rp{bet_per_number:,}/nomor | Total: Rp{total:,}\n"
-            f"Martingale Level: {martingale_level}\n"
+            f"{mode}🎯 BET Periode {periode}\n"
+            f"Posisi: 2D Belakang\n"
+            f"Besar/Kecil : <b>{bk_labels[bk_choice]}</b> (confidence: {bk_confidence:.0%}) — Level {bk_level}\n"
+            f"Genap/Ganjil: <b>{gj_labels[gj_choice]}</b> (confidence: {gj_confidence:.0%}) — Level {gj_level}\n"
+            f"Bet: Rp{bet_amount:,}/angka × 50 = Rp{bet_amount*50:,} per taruhan\n"
+            f"Total: Rp{total:,} (2 taruhan)"
         )
-        if analysis:
-            text += f"<i>{analysis[:200]}</i>"
         await self._send(text)
 
     # ─── Result ──────────────────────────────────────────────────────────────
 
-    async def send_result(
+    async def notify_result(
         self,
         periode: str,
-        draw_result_4d: str,
-        position: str,
-        predicted_bk: str,
-        predicted_gj: str,
-        actual_bk: str,
-        actual_gj: str,
+        full_result: str,      # "1295"
+        result_2d: str,        # "95"
+        actual_bk: str,        # "BE" | "KE"
+        actual_gj: str,        # "GE" | "GA"
+        bet_bk: Optional[str], # pilihan yang dipasang, None jika tidak bet
+        bet_gj: Optional[str],
         win_bk: bool,
         win_gj: bool,
-        total_wagered: int,
-        total_won: int,
-        consecutive_losses: int,
-        daily_loss: int,
+        profit_bk: int,        # net per bet (bisa negatif)
+        profit_gj: int,
+        balance: Optional[int] = None,
     ) -> None:
-        net = total_won - total_wagered
+        bk_labels = {"BE": "BESAR", "KE": "KECIL"}
+        gj_labels = {"GE": "GENAP", "GA": "GANJIL"}
+
         bk_icon = "✅" if win_bk else "❌"
         gj_icon = "✅" if win_gj else "❌"
 
-        if win_bk or win_gj:
-            header = f"🏆 <b>MENANG — Periode {periode}</b>"
-        else:
-            header = f"❌ <b>KALAH — Periode {periode}</b>"
+        total_profit = profit_bk + profit_gj
+        profit_str   = f"+Rp{total_profit:,}" if total_profit >= 0 else f"-Rp{abs(total_profit):,}"
 
-        net_str = f"+Rp{net:,}" if net >= 0 else f"-Rp{abs(net):,}"
+        bk_line = (
+            f"{bk_icon} Besar/Kecil: {bk_labels.get(actual_bk, actual_bk)}"
+            + (f" (bet: {bk_labels.get(bet_bk, bet_bk)})" if bet_bk else "")
+        )
+        gj_line = (
+            f"{gj_icon} Genap/Ganjil: {gj_labels.get(actual_gj, actual_gj)}"
+            + (f" (bet: {gj_labels.get(bet_gj, bet_gj)})" if bet_gj else "")
+        )
+
+        balance_line = f" | Saldo: Rp{balance:,}" if balance else ""
 
         text = (
-            f"{header}\n"
-            f"Hasil: <b>{draw_result_4d}</b> | Posisi: {position.upper()}\n"
-            f"{bk_icon} BK: prediksi <b>{predicted_bk.upper()}</b> → "
-            f"aktual <b>{actual_bk.upper()}</b>\n"
-            f"{gj_icon} GJ: prediksi <b>{predicted_gj.upper()}</b> → "
-            f"aktual <b>{actual_gj.upper()}</b>\n"
-            f"Net: {net_str} | Taruhan: Rp{total_wagered:,} | Menang: Rp{total_won:,}\n"
-            f"Kalah berturut: {consecutive_losses} | Rugi hari ini: Rp{daily_loss:,}"
+            f"📊 HASIL Periode {periode}: <b>{full_result}</b> (2D={result_2d})\n"
+            f"→ {bk_line}\n"
+            f"→ {gj_line}\n"
+            f"Profit: {profit_str}{balance_line}"
         )
         await self._send(text)
 
     # ─── Daily summary ───────────────────────────────────────────────────────
 
-    async def send_daily_summary(
+    async def notify_daily_summary(
         self,
         date: str,
         total_bets: int,
-        total_wagered: int,
-        total_won: int,
-        win_count: int,
-        loss_count: int,
-        final_balance: Optional[int] = None,
+        total_wins: int,
+        total_bet_amount: int,
+        total_win_amount: int,
+        profit: int,
+        ending_balance: Optional[int] = None,
     ) -> None:
-        net = total_won - total_wagered
-        net_str = f"+Rp{net:,}" if net >= 0 else f"-Rp{abs(net):,}"
-        win_rate = (win_count / total_bets * 100) if total_bets else 0
-        balance_line = f"Balance: Rp{final_balance:,}\n" if final_balance else ""
+        win_rate   = (total_wins / total_bets * 100) if total_bets else 0
+        profit_str = f"+Rp{profit:,}" if profit >= 0 else f"-Rp{abs(profit):,}"
+        bal_line   = f" | Saldo: Rp{ending_balance:,}" if ending_balance else ""
+
         text = (
-            f"📊 <b>Rekap Harian — {date}</b>\n"
-            f"Periode: {total_bets} (W:{win_count} L:{loss_count} | {win_rate:.1f}%)\n"
-            f"Taruhan: Rp{total_wagered:,}\n"
-            f"Menang : Rp{total_won:,}\n"
-            f"Net    : {net_str}\n"
-            f"{balance_line}"
+            f"📈 Ringkasan Hari Ini — {date}\n"
+            f"Periode: {total_bets} bet | Win: {total_wins}/{total_bets} ({win_rate:.1f}%)\n"
+            f"Total Bet: Rp{total_bet_amount:,} | Total Win: Rp{total_win_amount:,}\n"
+            f"Profit: {profit_str}{bal_line}"
         )
         await self._send(text)
 
     # ─── Misc ────────────────────────────────────────────────────────────────
 
-    async def send_alert(self, message: str) -> None:
+    async def notify_alert(self, message: str) -> None:
         await self._send(f"⚠️ <b>Alert</b>\n{message}")
-
-    async def send_info(self, message: str) -> None:
-        await self._send(f"ℹ️ {message}")
 
     async def send_startup(self, dry_run: bool = False) -> None:
         mode = " [DRY RUN MODE]" if dry_run else ""
@@ -154,5 +151,5 @@ class TelegramNotifier:
         await self._send(
             f"🚫 <b>Limit Rugi Harian Tercapai</b>\n"
             f"Rugi: Rp{daily_loss:,} / Limit: Rp{limit:,}\n"
-            f"Bot berhenti bet sampai tengah malam WIB."
+            f"Bot berhenti sampai tengah malam WIB."
         )

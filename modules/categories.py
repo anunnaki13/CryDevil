@@ -1,88 +1,136 @@
 """
-Result category parser — konversi hasil 4D menjadi kategori BK/GJ per posisi.
+Klasifikasi hasil 2D Belakang ke kategori Besar/Kecil dan Genap/Ganjil.
 
-Aturan:
-  Besar/Kecil  → ditentukan oleh digit PERTAMA pasangan
-    0,1,2,3,4 = Kecil  |  5,6,7,8,9 = Besar
-  Genap/Ganjil → ditentukan oleh digit KEDUA pasangan
-    0,2,4,6,8 = Genap  |  1,3,5,7,9 = Ganjil
+Aturan (sesuai blueprint):
+  Besar/Kecil → nilai KESELURUHAN angka 2D:
+    KECIL (KE) = 00–49  (digit pertama 0,1,2,3,4)
+    BESAR (BE) = 50–99  (digit pertama 5,6,7,8,9)
 
-Contoh hasil 4D "1295":
-  depan    = "12" → Kecil (1<5) + Genap (2%2==0)
-  tengah   = "29" → Kecil (2<5) + Ganjil (9%2!=0)
-  belakang = "95" → Besar (9>=5) + Ganjil (5%2!=0)
+  Genap/Ganjil → digit KEDUA (satuan) angka 2D:
+    GENAP  (GE) = digit satuan 0,2,4,6,8
+    GANJIL (GA) = digit satuan 1,3,5,7,9
+
+Contoh "95":
+  95 >= 50        → BE (BESAR)
+  digit satuan 5  → GA (GANJIL)
 """
 
-# ─── Kategori dasar ───────────────────────────────────────────────────────────
+# ─── Label kode ───────────────────────────────────────────────────────────────
 
-BESAR_KECIL_SMALL = {0, 1, 2, 3, 4}   # digit pertama → Kecil
-GENAP_DIGITS      = {0, 2, 4, 6, 8}   # digit kedua   → Genap
+CHOICE_LABELS = {
+    "BE": "BESAR",
+    "KE": "KECIL",
+    "GE": "GENAP",
+    "GA": "GANJIL",
+}
 
-
-def classify_pair(pair: str) -> dict:
-    """Klasifikasi satu pasangan 2 digit → BK dan GJ."""
-    d1, d2 = int(pair[0]), int(pair[1])
-    return {
-        "pair":          pair,
-        "besar_kecil":   "kecil" if d1 in BESAR_KECIL_SMALL else "besar",
-        "genap_ganjil":  "genap" if d2 in GENAP_DIGITS else "ganjil",
-    }
+BK_CHOICES = ("BE", "KE")
+GJ_CHOICES = ("GE", "GA")
 
 
-def parse_result(result_4d: str) -> dict | None:
+# ─── Klasifikasi ─────────────────────────────────────────────────────────────
+
+def classify_result(number_2d: str) -> dict:
     """
-    Parse hasil 4D menjadi dict kategori per posisi.
+    Klasifikasi angka 2D ke kode BK dan GJ.
 
     Args:
-        result_4d: string 4 digit, misal "1295"
+        number_2d: string 2 digit, misal "95"
 
     Returns:
         {
-            "raw": "1295",
-            "depan":    {"pair": "12", "besar_kecil": "kecil",  "genap_ganjil": "genap"},
-            "tengah":   {"pair": "29", "besar_kecil": "kecil",  "genap_ganjil": "ganjil"},
-            "belakang": {"pair": "95", "besar_kecil": "besar",  "genap_ganjil": "ganjil"},
+            "besar_kecil":        "BE" | "KE",
+            "genap_ganjil":       "GE" | "GA",
+            "besar_kecil_label":  "BESAR" | "KECIL",
+            "genap_ganjil_label": "GENAP" | "GANJIL",
+        }
+    """
+    num          = int(number_2d)
+    digit_second = num % 10
+
+    bk = "BE" if num >= 50 else "KE"
+    gj = "GE" if digit_second % 2 == 0 else "GA"
+
+    return {
+        "besar_kecil":        bk,
+        "genap_ganjil":       gj,
+        "besar_kecil_label":  CHOICE_LABELS[bk],
+        "genap_ganjil_label": CHOICE_LABELS[gj],
+    }
+
+
+def extract_belakang(result_4d: str) -> str | None:
+    """Ambil 2 digit terakhir dari hasil 4D. '1295' → '95'"""
+    import re
+    digits = re.sub(r"\D", "", str(result_4d).strip())
+    if len(digits) < 4:
+        return None
+    return digits[-2:]  # 2 digit terakhir
+
+
+def parse_result_full(result_4d: str) -> dict | None:
+    """
+    Parse hasil 4D lengkap.
+
+    Returns:
+        {
+            "full":     "1295",
+            "depan":    "12",
+            "tengah":   "29",
+            "belakang": "95",
+            "belakang_bk":  "BE",
+            "belakang_gj":  "GA",
         }
     """
     import re
     digits = re.sub(r"\D", "", str(result_4d).strip())
     if len(digits) < 4:
         return None
-    digits = digits[-4:]  # ambil 4 digit terakhir jika lebih
+    digits = digits[-4:]
+
+    belakang = digits[2:4]
+    cat      = classify_result(belakang)
 
     return {
-        "raw":      digits,
-        "depan":    classify_pair(digits[0:2]),
-        "tengah":   classify_pair(digits[1:3]),
-        "belakang": classify_pair(digits[2:4]),
+        "full":         digits,
+        "depan":        digits[0:2],
+        "tengah":       digits[1:3],
+        "belakang":     belakang,
+        "belakang_bk":  cat["besar_kecil"],
+        "belakang_gj":  cat["genap_ganjil"],
     }
 
 
-# ─── Generator angka per kategori ────────────────────────────────────────────
+# ─── Generator angka per kategori ─────────────────────────────────────────────
 
-def get_numbers_for_category(category: str) -> list[str]:
+def get_numbers_for_category(choice: str) -> list[str]:
     """
-    Kembalikan semua 50 angka 2D yang memenuhi kategori.
+    Generate 50 angka 2D yang memenuhi kategori.
 
-    category: "besar" | "kecil" | "genap" | "ganjil"
+    choice: "BE" | "KE" | "GE" | "GA"
     """
-    result = []
-    for n in range(100):
-        d1, d2 = n // 10, n % 10
-        num = f"{n:02d}"
-        if category == "besar"  and d1 not in BESAR_KECIL_SMALL: result.append(num)
-        if category == "kecil"  and d1 in BESAR_KECIL_SMALL:     result.append(num)
-        if category == "genap"  and d2 in GENAP_DIGITS:           result.append(num)
-        if category == "ganjil" and d2 not in GENAP_DIGITS:       result.append(num)
-    return result
+    if choice == "BE":
+        return [str(i) for i in range(50, 100)]
+    elif choice == "KE":
+        return [f"{i:02d}" for i in range(0, 50)]
+    elif choice == "GE":
+        return [f"{i:02d}" for i in range(0, 100) if i % 2 == 0]
+    elif choice == "GA":
+        return [f"{i:02d}" for i in range(0, 100) if i % 2 == 1]
+    else:
+        raise ValueError(f"Pilihan tidak valid: {choice}. Gunakan BE/KE/GE/GA")
 
 
-# ─── Helper ringkasan ─────────────────────────────────────────────────────────
+# ─── Helper format ────────────────────────────────────────────────────────────
 
-def result_summary(parsed: dict) -> str:
-    """Format ringkas: '1295 | Depan:Kecil/Genap | Tengah:Kecil/Ganjil | Belakang:Besar/Ganjil'"""
-    parts = []
-    for pos in ("depan", "tengah", "belakang"):
-        info = parsed[pos]
-        parts.append(f"{pos.capitalize()}:{info['besar_kecil'].capitalize()}/{info['genap_ganjil'].capitalize()}")
-    return f"{parsed['raw']} | " + " | ".join(parts)
+def result_summary(result_4d: str) -> str:
+    """Format ringkas hasil: '1295 → 2D=95 | BE (BESAR) + GA (GANJIL)'"""
+    parsed = parse_result_full(result_4d)
+    if not parsed:
+        return result_4d
+    bk = parsed["belakang_bk"]
+    gj = parsed["belakang_gj"]
+    return (
+        f"{parsed['full']} → 2D={parsed['belakang']} | "
+        f"{bk} ({CHOICE_LABELS[bk]}) + {gj} ({CHOICE_LABELS[gj]})"
+    )
