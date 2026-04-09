@@ -139,7 +139,17 @@ class AuthManager:
         if await self.is_logged_in():
             return True
         logger.info("Session expired — re-logging in")
-        return await self.login()
+        # Reset client to clear stale Cloudflare cookies before re-login
+        await self.close()
+        for attempt in range(1, 4):
+            result = await self.login()
+            if result:
+                return True
+            if attempt < 3:
+                logger.warning("Re-login attempt %d/3 failed — retrying in 5s", attempt)
+                await asyncio.sleep(5)
+        logger.error("Re-login failed after 3 attempts")
+        return False
 
     # ─── Balance ─────────────────────────────────────────────────────────────
 
