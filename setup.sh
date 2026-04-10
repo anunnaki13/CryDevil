@@ -5,8 +5,8 @@
 # ═══════════════════════════════════════════════════════
 set -e
 
-INSTALL_DIR="/opt/hokidraw-bot"
-SERVICE_NAME="hokidraw-bot"
+INSTALL_DIR="/opt/hokidraw-bot2"
+SERVICE_NAME="hokidraw-bot2"
 PYTHON="python3.11"
 
 echo ""
