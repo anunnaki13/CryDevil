@@ -33,6 +33,7 @@ from config import (
     POLL_START_MINUTE, POLL_INTERVAL_SECONDS, MAX_POLL_ATTEMPTS,
     BET_DEADLINE_MINUTE, DAILY_LOSS_LIMIT,
     LOG_PATH, BET_MODE, BET_TARGET, INSTANCE_LABEL,
+    MIN_CONFIDENCE_TO_BET,
     FLEET_SHARED_ANALYSIS, FLEET_ROLE, INSTANCE_NAME,
     validate_config,
 )
@@ -89,6 +90,12 @@ class HokidrawBot:
         self.notifier      = TelegramNotifier()
         self.tg_commands   = TelegramCommands(self.auth, self.mm)
         self._last_period: Optional[str] = None
+
+    @staticmethod
+    def _pick_single_candidate(bk_data: dict, gj_data: dict) -> tuple[str, dict]:
+        if bk_data["confidence"] >= gj_data["confidence"]:
+            return "besar_kecil", bk_data
+        return "genap_ganjil", gj_data
 
     async def _publish_snapshot(self, balance: Optional[int] = None) -> None:
         summary = await self.mm.get_status_summary()
@@ -256,8 +263,23 @@ class HokidrawBot:
             )
             bk_resp, gj_resp = results[0], results[1]
         else:
-            # single: pilih yang confidence tertinggi
-            if bk_data["confidence"] >= gj_data["confidence"]:
+            chosen_dimension, chosen_data = self._pick_single_candidate(bk_data, gj_data)
+            chosen_conf = chosen_data["confidence"]
+
+            if chosen_conf < MIN_CONFIDENCE_TO_BET:
+                logger.info(
+                    "[%s] Skip bet: confidence tertinggi %.0f%% masih di bawah threshold %.0f%%",
+                    INSTANCE_LABEL,
+                    chosen_conf * 100,
+                    MIN_CONFIDENCE_TO_BET * 100,
+                )
+                await self.notifier.notify_alert(
+                    "Skip bet: confidence tertinggi "
+                    f"{chosen_conf:.0%} masih di bawah threshold {MIN_CONFIDENCE_TO_BET:.0%}"
+                )
+                return
+
+            if chosen_dimension == "besar_kecil":
                 bk_resp = await self.bettor.place_bet(bk_data["choice"], bk_amount, self.dry_run)
                 gj_resp = None
             else:

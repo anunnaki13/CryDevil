@@ -27,7 +27,7 @@ from telegram.ext import (
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_COMMANDS_ENABLED, DB_PATH,
     MARTINGALE_LEVELS, DAILY_LOSS_LIMIT, BASE_BET, BET_MODE,
-    LLM_PRIMARY, INSTANCE_LABEL, BET_TARGET,
+    LLM_PRIMARY, INSTANCE_LABEL, BET_TARGET, FLEET_BOT_NAMES,
 )
 from modules import database as db
 from modules import fleet
@@ -63,6 +63,10 @@ class TelegramCommands:
     def _is_authorized(self, update: Update) -> bool:
         """Only respond to the configured chat ID."""
         return str(update.effective_chat.id) == str(TELEGRAM_CHAT_ID)
+
+    def _normalize_bot_name(self, raw: str) -> Optional[str]:
+        bot_name = raw.strip()
+        return bot_name if bot_name in FLEET_BOT_NAMES else None
 
     # ─── /start & /help ──────────────────────────────────────────────────────
 
@@ -302,7 +306,8 @@ class TelegramCommands:
             return
         bots = fleet.get_snapshots()
         lines = ["<b>Status Fleet Bot</b>\n"]
-        for bot_name, snapshot in bots.items():
+        for bot_name in FLEET_BOT_NAMES:
+            snapshot = bots.get(bot_name, {})
             lines.append(
                 f"{bot_name} | {'ON' if snapshot.get('enabled', True) else 'OFF'} | "
                 f"target={snapshot.get('target', '?')} | balance={snapshot.get('balance', '?')} | "
@@ -316,7 +321,12 @@ class TelegramCommands:
         if not context.args:
             await update.message.reply_text("Gunakan: /bot_on bot-2")
             return
-        bot_name = context.args[0].strip()
+        bot_name = self._normalize_bot_name(context.args[0])
+        if not bot_name:
+            await update.message.reply_text(
+                f"Nama bot tidak valid. Pilihan: {', '.join(FLEET_BOT_NAMES)}"
+            )
+            return
         fleet.set_bot_enabled(bot_name, True)
         await update.message.reply_text(f"{bot_name} diaktifkan.")
 
@@ -326,7 +336,12 @@ class TelegramCommands:
         if not context.args:
             await update.message.reply_text("Gunakan: /bot_off bot-2")
             return
-        bot_name = context.args[0].strip()
+        bot_name = self._normalize_bot_name(context.args[0])
+        if not bot_name:
+            await update.message.reply_text(
+                f"Nama bot tidak valid. Pilihan: {', '.join(FLEET_BOT_NAMES)}"
+            )
+            return
         fleet.set_bot_enabled(bot_name, False)
         await update.message.reply_text(f"{bot_name} dimatikan.")
 

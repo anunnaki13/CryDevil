@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════
-#  HOKIDRAW BOT — Setup Otomatis untuk Ubuntu VPS
+#  CRYDEVIL — Setup Otomatis untuk Ubuntu VPS
 #  Jalankan: bash setup.sh
 # ═══════════════════════════════════════════════════════
 set -e
@@ -11,7 +11,7 @@ PYTHON="python3.11"
 
 echo ""
 echo "╔══════════════════════════════════════════╗"
-echo "║     HOKIDRAW BOT — SETUP VPS UBUNTU     ║"
+echo "║       CRYDEVIL — SETUP VPS UBUNTU       ║"
 echo "╚══════════════════════════════════════════╝"
 echo ""
 
@@ -98,8 +98,8 @@ $SUDO cp "$INSTALL_DIR/hokidraw-bot.service" /etc/systemd/system/$SERVICE_NAME.s
 $SUDO cp "$INSTALL_DIR/hokidraw-bot@.service" /etc/systemd/system/hokidraw-bot@.service
 $SUDO sed -i "s|/opt/hokidraw-bot|$INSTALL_DIR|g" /etc/systemd/system/$SERVICE_NAME.service
 $SUDO sed -i "s|/opt/hokidraw-bot|$INSTALL_DIR|g" /etc/systemd/system/hokidraw-bot@.service
-$SUDO sed -i "s|User=ubuntu|User=$USER|g" /etc/systemd/system/$SERVICE_NAME.service
-$SUDO sed -i "s|User=ubuntu|User=$USER|g" /etc/systemd/system/hokidraw-bot@.service
+$SUDO sed -i "s|User=__SERVICE_USER__|User=$USER|g" /etc/systemd/system/$SERVICE_NAME.service
+$SUDO sed -i "s|User=__SERVICE_USER__|User=$USER|g" /etc/systemd/system/hokidraw-bot@.service
 $SUDO systemctl daemon-reload
 
 # ═══════════════════════════════════════════════════════

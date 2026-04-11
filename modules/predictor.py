@@ -33,6 +33,7 @@ Analisis yang harus dilakukan:
 3. Analisis streak/pola terakhir (apakah ada pola berturut-turut?)
 4. Analisis 10 dan 20 periode terakhir (trend terkini)
 5. Identifikasi apakah ada bias signifikan
+6. Berikan confidence yang realistis, bukan asal tinggi
 
 ATURAN KLASIFIKASI:
 - BESAR (BE) = angka 50-99 (digit pertama 5-9)
@@ -86,6 +87,7 @@ Untuk setiap bot aktif:
 Pertimbangan risiko:
 - jika daily loss bot sudah tinggi, martingale level tinggi, atau status bot tidak sehat, lebih konservatif
 - jika bot nonaktif, action harus SKIP
+- gunakan confidence yang realistis; jika prediksi lemah, lebih baik sarankan SKIP
 
 Balas HANYA JSON dengan format:
 {{

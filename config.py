@@ -41,13 +41,6 @@ def _int_list(key: str, default: list[int]) -> list[int]:
     raw = os.getenv(key, "").strip()
     if not raw:
         return default
-
-
-def _str_list(key: str, default: list[str]) -> list[str]:
-    raw = os.getenv(key, "").strip()
-    if not raw:
-        return default
-    return [x.strip() for x in raw.split(",") if x.strip()]
     try:
         return [int(x.strip()) for x in raw.split(",") if x.strip()]
     except ValueError:
@@ -56,6 +49,13 @@ def _str_list(key: str, default: list[str]) -> list[str]:
             f"pakai default {default}"
         )
         return default
+
+
+def _str_list(key: str, default: list[str]) -> list[str]:
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        return default
+    return [x.strip() for x in raw.split(",") if x.strip()]
 
 
 _errors: list[str] = []
@@ -107,6 +107,7 @@ BET_TYPE   = "B"
 #   "double" = 2 bet (BK + GJ) → total 2 × Rp5.000 = Rp10.000
 #   "single" = 1 bet (hanya yang confidence tertinggi)
 BET_MODE = _optional("BET_MODE", "double")
+MIN_CONFIDENCE_TO_BET = _float("MIN_CONFIDENCE_TO_BET", 0.60)
 
 # ─── 5. Martingale ───────────────────────────────────────────────────────────
 # 5 level, per ANGKA (IDR). Total/bet = level × 50 angka.
@@ -227,6 +228,11 @@ def validate_config(exit_on_error: bool = True) -> bool:
     if BET_MODE not in ("single", "double"):
         logic_errors.append(f"  BET_MODE='{BET_MODE}' tidak valid. Pilih: single atau double")
 
+    if not (0.0 <= MIN_CONFIDENCE_TO_BET <= 1.0):
+        logic_errors.append(
+            f"  MIN_CONFIDENCE_TO_BET={MIN_CONFIDENCE_TO_BET} tidak valid. Gunakan nilai 0.0 sampai 1.0"
+        )
+
     if BET_TARGET not in ("depan", "tengah", "belakang"):
         logic_errors.append(
             f"  BET_TARGET='{BET_TARGET}' tidak valid. Pilih: depan, tengah, atau belakang"
@@ -240,6 +246,19 @@ def validate_config(exit_on_error: bool = True) -> bool:
     if FLEET_SHARED_ANALYSIS and FLEET_ROLE == "solo":
         logic_errors.append(
             "  FLEET_SHARED_ANALYSIS aktif tetapi FLEET_ROLE masih 'solo'. Gunakan leader atau worker"
+        )
+
+    if FLEET_SHARED_ANALYSIS and INSTANCE_NAME not in FLEET_BOT_NAMES:
+        logic_errors.append(
+            f"  INSTANCE_NAME='{INSTANCE_NAME}' tidak ada di FLEET_BOT_NAMES={FLEET_BOT_NAMES}"
+        )
+
+    if FLEET_SHARED_ANALYSIS and len(set(FLEET_BOT_NAMES)) != len(FLEET_BOT_NAMES):
+        logic_errors.append("  FLEET_BOT_NAMES mengandung nama bot duplikat")
+
+    if TELEGRAM_COMMANDS_ENABLED and FLEET_SHARED_ANALYSIS and FLEET_ROLE == "worker":
+        _warnings.append(
+            "  [WARNING] TELEGRAM_COMMANDS_ENABLED aktif pada worker. Disarankan hanya leader yang aktif polling command Telegram"
         )
 
     if logic_errors:
@@ -261,6 +280,7 @@ def validate_config(exit_on_error: bool = True) -> bool:
         print(f"  LLM Model    : {LLM_PRIMARY}")
         print(f"  Posisi       : 2D {BET_TARGET.title()}")
         print(f"  Bet/angka    : Rp{BASE_BET:,}  |  bet param: {BASE_BET/1000}  |  Tipe: BET FULL (B)  |  Mode: {BET_MODE}")
+        print(f"  Min Conf     : {MIN_CONFIDENCE_TO_BET:.0%}")
         print(f"  Total/round  : Rp{total:,}  (50 angka × {'2 bet' if BET_MODE=='double' else '1 bet'} × Rp{BASE_BET:,})")
         print(f"  Pot. menang  : Rp{BASE_BET * 100:,}/bet (100x)")
         lv_str = " → ".join(f"Rp{x:,}" for x in MARTINGALE_LEVELS)

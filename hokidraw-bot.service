@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-User=ubuntu
+User=__SERVICE_USER__
 WorkingDirectory=/opt/hokidraw-bot
 EnvironmentFile=/opt/hokidraw-bot/.env
 ExecStart=/opt/hokidraw-bot/venv/bin/python main.py

@@ -4,6 +4,8 @@ Bot otomatis untuk memasang taruhan **2D Hokidraw** pada posisi **depan**, **ten
 Untuk setiap posisi 2D, bot menganalisis dua dimensi taruhan independen: **Besar/Kecil** dan **Genap/Ganjil**.
 Menggunakan **OpenRouter LLM** untuk analisis pola dan prediksi, **Telegram** untuk notifikasi real-time.
 
+Untuk layout VPS yang rapi, pola 3 bot, dan coexistence dengan aplikasi bot lain di server yang sama, lihat [DEPLOYMENT.md](DEPLOYMENT.md).
+
 ---
 
 ## Mekanisme Permainan
@@ -67,7 +69,7 @@ Outcome (BK dan GJ independen, masing-masing 50% win rate):
 ## Fitur Utama
 
 - **Prediksi LLM** — analisis 200 hasil terakhir via OpenRouter (Gemini 2.0 Flash / Claude sebagai fallback)
-- **Betting Full** — selalu Quick 2D Bet Full (payout ×100), 2 bet per periode (BK + GJ)
+- **Confidence-driven Single Bet** — default memilih satu dimensi dengan confidence LLM tertinggi
 - **3 Posisi Target** — satu instance bot bisa difokuskan ke `depan`, `tengah`, atau `belakang`
 - **Martingale Terpisah** — level BK dan GJ dikelola **sendiri-sendiri**, menang salah satu tidak reset yang lain
 - **5 Level Martingale** — Rp100 → Rp200 → Rp400 → Rp800 → Rp1.600/angka
@@ -86,7 +88,7 @@ Outcome (BK dan GJ independen, masing-masing 50% win rate):
 ## Struktur Proyek
 
 ```
-barbatos/
+CryDevil/
 ├── main.py                  # Entry point + APScheduler hourly cycle
 ├── config.py                # Semua setting dibaca dari .env
 ├── .env.example             # Template konfigurasi lengkap (salin ke .env)
@@ -122,8 +124,8 @@ barbatos/
 
 ```bash
 # 1. Clone repo
-git clone https://github.com/anunnaki13/barbatos.git
-cd barbatos
+git clone https://github.com/anunnaki13/CryDevil.git
+cd CryDevil
 
 # 2. Jalankan setup
 bash setup.sh
@@ -162,7 +164,8 @@ nano /opt/hokidraw-bot/.env
 |---|---|---|
 | `BET_TARGET` | `belakang` | Posisi target 2D: `depan`, `tengah`, atau `belakang` |
 | `BASE_BET` | `100` | Nominal per **angka** (IDR). `bet_param = BASE_BET ÷ 1.000` yang dikirim ke API |
-| `BET_MODE` | `double` | `double` = 2 bet/periode (BK+GJ) · `single` = 1 bet terkuat |
+| `BET_MODE` | `single` | `single` = pilih 1 dimensi dengan confidence tertinggi · `double` = 2 bet/periode |
+| `MIN_CONFIDENCE_TO_BET` | `0.60` | Jika confidence tertinggi BK/GJ di bawah threshold ini, bot skip |
 
 > **Tipe bet selalu Bet Full (B) — payout ×100.** Tidak bisa diubah.
 
@@ -251,19 +254,12 @@ python main.py
 ```
 
 ## Menjalankan 3 Bot di 1 VPS Dengan 1 Analisa LLM
+Panduan operasional yang lebih rapi ada di [DEPLOYMENT.md](DEPLOYMENT.md). Ringkasnya, satu codebase dipakai bersama dan setiap bot dibedakan oleh `.env`, akun website, DB, log, dan state directory masing-masing.
 
-Struktur yang disarankan:
-
-```bash
-/opt/hokidraw-bot/
-├── venv/
-├── main.py
-├── instances/
-│   ├── bot-1/.env
-│   ├── bot-2/.env
-│   ├── bot-3/.env
-│   └── bot-3/.env
-```
+Dalam mode yang direkomendasikan:
+- bot menilai dua opsi per posisi: `Besar/Kecil` dan `Genap/Ganjil`
+- bot hanya memilih satu opsi dengan confidence tertinggi
+- jika confidence tertinggi masih di bawah `MIN_CONFIDENCE_TO_BET`, bot `SKIP`
 
 Rancangan final 3 bot:
 
@@ -299,6 +295,7 @@ FLEET_BOT_NAMES=bot-1,bot-2,bot-3
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
 TELEGRAM_COMMANDS_ENABLED=true
+MIN_CONFIDENCE_TO_BET=0.60
 ```
 
 Jika semua bot memakai 1 bot Telegram yang sama:
@@ -369,7 +366,7 @@ Menit :05 setiap jam (WIB)
 ├─ [1] Login check — re-login otomatis jika sesi expired
 │
 ├─ [2] Poll hasil draw baru (maks 10x, interval 2 menit)
-│       └─ Parse 4D → ekstrak belakang → klasifikasi BE/KE + GE/GA → simpan DB
+│       └─ Parse 4D → ekstrak posisi target instance → klasifikasi BE/KE + GE/GA → simpan DB
 │
 ├─ [3] Settle pending bets dari periode sebelumnya
 │       ├─ Cek bet BK: pilihan cocok dengan belakang_bk? → won / lost
@@ -379,11 +376,11 @@ Menit :05 setiap jam (WIB)
 │
 ├─ [4] Cek daily loss limit → pause jika tercapai
 │
-├─ [5] Ambil 200 history draw dari DB
-│       └─ Format tabel: Periode | 2D | Besar/Kecil | Genap/Ganjil
+├─ [5] Ambil 200 history draw
+│       └─ Solo: analisa target instance sendiri | Fleet: leader analisa 4D sekali untuk semua bot
 │
 ├─ [6] Kirim ke LLM via OpenRouter
-│       └─ Analisis: frekuensi, streak, trend 10 & 20 periode terakhir
+│       └─ Analisis: frekuensi, streak, trend 10 & 20 periode terakhir + confidence + keputusan BET/SKIP jika fleet aktif
 │
 ├─ [7] LLM return prediksi:
 │       {besar_kecil: {choice:"BE", confidence:0.65, reason:"..."},
@@ -391,9 +388,9 @@ Menit :05 setiap jam (WIB)
 │
 ├─ [8] Ambil bet amount per dimensi (sesuai martingale level masing-masing)
 │
-├─ [9] Place double bet (Bet Full, Quick 2D, posisi Belakang):
-│       ├─ BK: POST /games/4d/send → 50 angka BE atau KE, bet_param=BASE_BET/1000
-│       └─ GJ: POST /games/4d/send → 50 angka GE atau GA, bet_param=BASE_BET/1000
+├─ [9] Pilih satu opsi dengan confidence tertinggi:
+│       ├─ jika max(BK, GJ) < threshold → SKIP
+│       └─ jika lolos threshold → POST /games/4d/send untuk satu kategori terpilih
 │
 └─ [10] Notifikasi Telegram: periode, pilihan, confidence, total taruhan
 
@@ -406,11 +403,11 @@ Pukul 23:55 WIB
 
 ## Database SQLite
 
-Semua data disimpan di `data/hokidraw.db`:
+Semua data disimpan di DB SQLite per instance:
 
 | Tabel | Isi |
 |---|---|
-| `results` | Setiap draw: 4D lengkap, depan/tengah/belakang, `belakang_bk`, `belakang_gj` |
+| `results` | Setiap draw: 4D lengkap, `target_position`, `target_number_2d`, `target_bk`, `target_gj` |
 | `bets` | **1 row per dimensi** — kolom: `bet_dimension`, `bet_choice`, `bet_amount_per_angka`, `confidence`, `status`, `win_amount`, `result_match` |
 | `daily_stats` | Per tanggal: total bet, total win, profit/loss, saldo akhir |
 | `bot_state` | State persisten: `consecutive_losses_bk`, `consecutive_losses_gj`, `martingale_level_bk`, `martingale_level_gj`, `daily_loss`, `last_period`, `bot_paused` |
@@ -470,7 +467,7 @@ sudo systemctl restart hokidraw-bot
 
 ## Catatan Penting
 
-> **Bot selalu menggunakan Bet Full (payout ×100)** via menu Quick 2D posisi Belakang.
+> **Bot selalu menggunakan Bet Full (payout ×100)** via menu Quick 2D pada posisi target instance.
 
 > **Win rate ~50% per dimensi** — jauh lebih baik dari tebak angka spesifik (1%). Martingale tetap ada risiko pada losing streak panjang.
 
