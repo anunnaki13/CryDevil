@@ -67,22 +67,29 @@ class Scraper:
     # ─── Current period ───────────────────────────────────────────────────────
 
     async def get_current_periode(self) -> Optional[str]:
-        """Parse current betting periode from game page or derive from history."""
+        """Parse current betting periode dari load endpoint, lalu fallback ke game page/history."""
         client = await self._client()
+
+        for game_name in (GAME_TYPE, "4d"):
+            try:
+                resp = await client.get(
+                    f"{BASE_URL}/games/4d/load/{game_name}/{POOL_ID}",
+                    headers=HEADERS,
+                )
+                period = self._extract_periode(resp.text)
+                if period:
+                    return period
+            except Exception as e:
+                logger.debug("Period fetch from load/%s failed: %s", game_name, e)
+
         try:
             resp = await client.get(
                 f"{BASE_URL}/games/4d/{POOL_ID}",
                 headers=HEADERS,
             )
-            soup = BeautifulSoup(resp.text, "lxml")
-            # Hidden field named 'periode'
-            tag = soup.find("input", {"name": "periode"}) or soup.find(attrs={"name": "periode"})
-            if tag and tag.get("value", "").strip():
-                return tag.get("value", "").strip()
-            # Fallback: find in text
-            match = re.search(r"periode[\"'\s:]+([A-Z0-9\-]+)", resp.text)
-            if match:
-                return match.group(1)
+            period = self._extract_periode(resp.text)
+            if period:
+                return period
         except Exception as e:
             logger.error("Period fetch from game page failed: %s", e)
 
@@ -97,6 +104,27 @@ class Scraper:
                 return next_period
         except Exception as e:
             logger.error("Period derivation from history failed: %s", e)
+        return None
+
+    @staticmethod
+    def _extract_periode(html: str) -> Optional[str]:
+        soup = BeautifulSoup(html, "lxml")
+        tag = (
+            soup.find("input", {"name": "periode"})
+            or soup.find("input", {"id": "periode"})
+            or soup.find(attrs={"name": "periode"})
+        )
+        if tag and tag.get("value", "").strip():
+            return tag.get("value", "").strip()
+
+        match = re.search(r"Periode\s*:\s*([0-9A-Z\-]+)", html, re.I)
+        if match:
+            return match.group(1).strip()
+
+        match = re.search(r"periode[\"'\s:=>]+([0-9A-Z\-]+)", html, re.I)
+        if match:
+            return match.group(1).strip()
+
         return None
 
     # ─── Draw history ─────────────────────────────────────────────────────────

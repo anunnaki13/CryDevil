@@ -9,6 +9,7 @@ import logging
 from typing import Optional
 
 import httpx
+from bs4 import BeautifulSoup
 
 from config import (
     BASE_URL, POOL_ID, GAME_TYPE, BET_TYPE, BET_POSISI,
@@ -100,13 +101,20 @@ class Bettor:
             data["_choice"]    = choice
             data["_label"]     = CHOICE_LABELS[choice]
             data["_total_idr"] = total_idr
+            data["_accepted_count"] = self._count_accepted_transactions(data)
 
             ok = data.get("status") in (1, "1", True, "true", "ok", "success")
             if ok:
                 logger.info(
-                    "Bet OK — %s | periode=%s balance=%s",
-                    choice, data.get("periode"), data.get("balance"),
+                    "Bet OK — %s | periode=%s balance=%s accepted=%s",
+                    choice, data.get("periode"), data.get("balance"), data["_accepted_count"],
                 )
+                if data["_accepted_count"] not in (0, len(numbers)):
+                    logger.warning(
+                        "Accepted count tidak penuh untuk %s: expected=%s actual=%s",
+                        choice, len(numbers), data["_accepted_count"],
+                    )
+                data["_history_verify_count"] = await self._verify_latest_history(numbers)
             else:
                 logger.error("Bet GAGAL — %s: %s", choice, data)
 
@@ -179,3 +187,43 @@ class Bettor:
         """Konversi IDR ke satuan ribu untuk API. Rp 100 → '0.1'"""
         val = amount_idr / 1000
         return str(int(val)) if val == int(val) else str(round(val, 3))
+
+    @staticmethod
+    def _count_accepted_transactions(data: dict) -> int:
+        transaksi = str(data.get("transaksi", "") or "")
+        if not transaksi:
+            return 0
+        return transaksi.count("//") + transaksi.count("\\/\\/") + 1
+
+    async def _verify_latest_history(self, expected_numbers: list[str]) -> int:
+        """
+        Verifikasi ringan setelah submit:
+        ambil history game aktif sekali, lalu hitung berapa angka expected yang muncul
+        di 50 row teratas. Non-fatal jika gagal.
+        """
+        client = await self._auth.get_client()
+        try:
+            resp = await client.get(
+                f"{BASE_URL}/games/4d/history/{GAME_TYPE}/{POOL_ID}",
+                headers=AJAX_HEADERS,
+            )
+            soup = BeautifulSoup(resp.text, "lxml")
+            rows = soup.select("table tbody tr")
+            latest_numbers = []
+            for tr in rows[:50]:
+                cols = [td.get_text(strip=True) for td in tr.find_all("td")]
+                if len(cols) >= 2:
+                    latest_numbers.append(cols[1])
+
+            matched = len(set(expected_numbers) & set(latest_numbers))
+            if matched and matched != len(expected_numbers):
+                logger.warning(
+                    "History verify parsial: expected=%s matched=%s",
+                    len(expected_numbers), matched,
+                )
+            elif matched == len(expected_numbers):
+                logger.info("History verify OK: %s/%s angka terdeteksi", matched, len(expected_numbers))
+            return matched
+        except Exception as e:
+            logger.debug("History verify failed: %s", e)
+            return 0

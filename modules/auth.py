@@ -9,7 +9,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from config import (
-    BASE_URL, USERNAME, PASSWORD,
+    BASE_URL, USERNAME, PASSWORD, POOL_ID,
     HEADERS, AJAX_HEADERS, SESSION_VALIDATION_INTERVAL,
 )
 
@@ -175,6 +175,20 @@ class AuthManager:
                 return int(float(clean))
         except Exception as e:
             logger.error("Balance fetch failed: %s", e)
+
+        # Fallback dari hidden field panel game.
+        try:
+            resp = await client.get(
+                f"{BASE_URL}/games/4d/load/4d/{POOL_ID}",
+                headers=HEADERS,
+            )
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "lxml")
+            tag = soup.find("input", {"id": "duitku"})
+            if tag and tag.get("value", "").strip():
+                return int(float(tag.get("value", "0").strip()))
+        except Exception as e:
+            logger.error("Balance fallback from game panel failed: %s", e)
         return None
 
     # ─── Playwright fallback ──────────────────────────────────────────────────
