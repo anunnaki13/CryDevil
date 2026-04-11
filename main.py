@@ -168,6 +168,7 @@ class HokidrawBot:
         forced_period: str | None = None,
         trigger: str = "scheduled",
     ) -> tuple[bool, str]:
+        is_manual_betnow = trigger == "betnow"
         # 4. Cek daily limit
         if not await self.mm.check_and_enforce_daily_limit():
             await self.notifier.send_limit_reached(
@@ -230,7 +231,7 @@ class HokidrawBot:
                     INSTANCE_NAME, BET_TARGET, my_plan.get("target")
                 )
                 return False, "plan_target_mismatch"
-            if my_plan.get("action") != "BET":
+            if my_plan.get("action") != "BET" and not is_manual_betnow:
                 logger.info("Plan fleet memutuskan SKIP untuk %s: %s", INSTANCE_NAME, my_plan.get("note", ""))
                 await self._store_signal_snapshot(
                     periode,
@@ -241,6 +242,13 @@ class HokidrawBot:
                     note=my_plan.get("note", trigger),
                 )
                 return False, f"fleet_skip:{periode}"
+            if my_plan.get("action") != "BET" and is_manual_betnow:
+                logger.info(
+                    "[%s] BET NOW override plan SKIP untuk %s: %s",
+                    INSTANCE_LABEL,
+                    INSTANCE_NAME,
+                    my_plan.get("note", ""),
+                )
 
             bk_data = my_plan["besar_kecil"]
             gj_data = my_plan["genap_ganjil"]
@@ -312,7 +320,7 @@ class HokidrawBot:
             chosen_dimension, chosen_data = self._pick_single_candidate(bk_data, gj_data)
             chosen_conf = chosen_data["confidence"]
 
-            if chosen_conf < MIN_CONFIDENCE_TO_BET:
+            if chosen_conf < MIN_CONFIDENCE_TO_BET and not is_manual_betnow:
                 logger.info(
                     "[%s] Skip bet: confidence tertinggi %.0f%% masih di bawah threshold %.0f%%",
                     INSTANCE_LABEL,
@@ -335,6 +343,13 @@ class HokidrawBot:
                     note=f"below_threshold:{trigger}",
                 )
                 return False, f"below_threshold:{periode}"
+            if chosen_conf < MIN_CONFIDENCE_TO_BET and is_manual_betnow:
+                logger.info(
+                    "[%s] BET NOW override threshold %.0f%% < %.0f%%",
+                    INSTANCE_LABEL,
+                    chosen_conf * 100,
+                    MIN_CONFIDENCE_TO_BET * 100,
+                )
 
             await self._store_signal_snapshot(
                 periode,
@@ -354,6 +369,23 @@ class HokidrawBot:
             else:
                 gj_resp = await self.bettor.place_bet(gj_data["choice"], gj_amount, self.dry_run)
                 bk_resp = None
+
+        bk_ok = self.bettor.is_bet_successful(bk_resp)
+        gj_ok = self.bettor.is_bet_successful(gj_resp)
+        if bk_resp is not None and not bk_ok:
+            logger.error("[%s] Bet BK gagal: %s", INSTANCE_LABEL, self.bettor.get_failure_reason(bk_resp))
+        if gj_resp is not None and not gj_ok:
+            logger.error("[%s] Bet GJ gagal: %s", INSTANCE_LABEL, self.bettor.get_failure_reason(gj_resp))
+        if not (bk_ok or gj_ok):
+            if bk_resp is not None:
+                return False, f"bet_failed:{self.bettor.get_failure_reason(bk_resp)}"
+            if gj_resp is not None:
+                return False, f"bet_failed:{self.bettor.get_failure_reason(gj_resp)}"
+            return False, "bet_failed"
+        if not bk_ok:
+            bk_resp = None
+        if not gj_ok:
+            gj_resp = None
 
         # 10. Simpan ke DB
         await self._save_bets(
@@ -434,7 +466,7 @@ class HokidrawBot:
 
         period = await self.scraper.get_current_periode()
         if not period:
-            return "Gagal mengambil periode aktif."
+            return "Periode aktif tidak tersedia. Market kemungkinan masih BET CLOSE."
         if period == self._last_period:
             return f"Periode <b>{period}</b> sudah pernah dibet. Siklus berikutnya akan skip otomatis."
 

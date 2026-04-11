@@ -34,6 +34,7 @@ from config import (
 from modules import database as db
 from modules import fleet
 from modules.auth import AuthManager
+from modules.categories import get_target_result, parse_result_full
 from modules.money_manager import MoneyManager
 from modules.predictor import Predictor
 from modules.scraper import Scraper
@@ -310,17 +311,28 @@ class TelegramCommands:
         if not self._is_authorized(update):
             return
 
-        results = await db.get_recent_results(10)
-        if not results:
-            await update.message.reply_text("Belum ada data hasil draw di database.")
+        if self._scraper is None:
+            await update.message.reply_text("Scraper tidak tersedia di instance ini.")
+            return
+
+        history = await self._scraper.get_draw_history(limit=10)
+        if not history:
+            await update.message.reply_text("Gagal mengambil history draw dari website.")
             return
 
         lines = ["<b>10 Hasil Draw Terakhir</b>\n"]
-        for r in results:
+        for item in history:
+            period = item.get("periode") or item.get("period") or "-"
+            full_number = str(item.get("result", "")).strip()
+            parsed = parse_result_full(full_number)
+            if not parsed:
+                lines.append(f"P{period} | {full_number or '?'} | parse gagal")
+                continue
+            target_data = get_target_result(parsed, BET_TARGET)
             lines.append(
-                f"P{r['period']} | {r['full_number']} | "
-                f"2D {r['target_position']}={r['target_number_2d']} | "
-                f"BK {r['target_bk']} | GJ {r['target_gj']}"
+                f"P{period} | {parsed['full']} | "
+                f"2D {BET_TARGET}={target_data['number_2d']} | "
+                f"BK {target_data['besar_kecil']} | GJ {target_data['genap_ganjil']}"
             )
 
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")

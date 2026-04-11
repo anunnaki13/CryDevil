@@ -143,6 +143,39 @@ class Bettor:
         gj_result = await self.place_bet(gj_choice, gj_amount, dry_run=dry_run)
         return [bk_result, gj_result]
 
+    @staticmethod
+    def is_bet_successful(response: Optional[dict]) -> bool:
+        if not response:
+            return False
+        if response.get("status") == "dry_run":
+            return True
+
+        raw = str(response.get("raw", "") or response.get("msg", "") or response.get("message", ""))
+        if "bet close" in raw.lower():
+            return False
+
+        status = response.get("status")
+        accepted = int(response.get("_accepted_count", 0) or 0)
+        if status in (1, "1", True, "true", "ok", "success") and accepted > 0:
+            return True
+        return False
+
+    @staticmethod
+    def get_failure_reason(response: Optional[dict]) -> str:
+        if not response:
+            return "request_failed"
+
+        for key in ("msg", "message", "raw"):
+            text = str(response.get(key, "") or "").strip()
+            if text:
+                normalized = " ".join(text.split())
+                if len(normalized) > 120:
+                    normalized = normalized[:117] + "..."
+                return normalized
+
+        status = response.get("status")
+        return f"status={status}" if status is not None else "bet_failed"
+
     # ─── Win check ────────────────────────────────────────────────────────────
 
     @staticmethod

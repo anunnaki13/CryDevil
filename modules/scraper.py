@@ -69,6 +69,7 @@ class Scraper:
     async def get_current_periode(self) -> Optional[str]:
         """Parse current betting periode dari load endpoint, lalu fallback ke game page/history."""
         client = await self._client()
+        saw_closed_marker = False
 
         for game_name in (GAME_TYPE, "4d"):
             try:
@@ -76,6 +77,8 @@ class Scraper:
                     f"{BASE_URL}/games/4d/load/{game_name}/{POOL_ID}",
                     headers=HEADERS,
                 )
+                if self._is_bet_closed(resp.text):
+                    saw_closed_marker = True
                 period = self._extract_periode(resp.text)
                 if period:
                     return period
@@ -87,11 +90,17 @@ class Scraper:
                 f"{BASE_URL}/games/4d/{POOL_ID}",
                 headers=HEADERS,
             )
+            if self._is_bet_closed(resp.text):
+                saw_closed_marker = True
             period = self._extract_periode(resp.text)
             if period:
                 return period
         except Exception as e:
             logger.error("Period fetch from game page failed: %s", e)
+
+        if saw_closed_marker:
+            logger.info("Periode aktif tidak tersedia karena market sedang BET CLOSE")
+            return None
 
         # Fallback: derive next periode from latest history entry
         try:
@@ -112,6 +121,8 @@ class Scraper:
         tag = (
             soup.find("input", {"name": "periode"})
             or soup.find("input", {"id": "periode"})
+            or soup.find("input", {"name": "period"})
+            or soup.find("input", {"id": "period"})
             or soup.find(attrs={"name": "periode"})
         )
         if tag and tag.get("value", "").strip():
@@ -126,6 +137,15 @@ class Scraper:
             return match.group(1).strip()
 
         return None
+
+    @staticmethod
+    def _is_bet_closed(html: str) -> bool:
+        lowered = html.lower()
+        return (
+            "bet close" in lowered
+            or "pasaran telah tutup" in lowered
+            or "dibuka kembali setelah pembukaan hasil result" in lowered
+        )
 
     # ─── Draw history ─────────────────────────────────────────────────────────
 
