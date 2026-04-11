@@ -15,17 +15,17 @@ CREATE TABLE IF NOT EXISTS results (
     period               TEXT    UNIQUE NOT NULL,
     draw_time            TEXT    NOT NULL,
     full_number          TEXT    NOT NULL,       -- 4 digit: "1295"
-    number_2d_depan      TEXT,                   -- "12"
-    number_2d_tengah     TEXT,                   -- "29"
-    number_2d_belakang   TEXT    NOT NULL,       -- "95"
-    belakang_bk          TEXT    NOT NULL,       -- "BE" | "KE"
-    belakang_gj          TEXT    NOT NULL,       -- "GE" | "GA"
+    target_position      TEXT    NOT NULL,       -- depan | tengah | belakang
+    target_number_2d     TEXT    NOT NULL,       -- "12"/"29"/"95"
+    target_bk            TEXT    NOT NULL,       -- "BE" | "KE"
+    target_gj            TEXT    NOT NULL,       -- "GE" | "GA"
     created_at           TEXT    DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS bets (
     id                     INTEGER PRIMARY KEY AUTOINCREMENT,
     period                 TEXT    NOT NULL,
+    target_position        TEXT    NOT NULL,
     bet_dimension          TEXT    NOT NULL,   -- "besar_kecil" | "genap_ganjil"
     bet_choice             TEXT    NOT NULL,   -- "BE" | "KE" | "GE" | "GA"
     bet_amount_per_angka   REAL    NOT NULL,   -- Rp per angka (integer IDR)
@@ -69,7 +69,9 @@ CREATE TABLE IF NOT EXISTS bot_state (
 # ─── Init ─────────────────────────────────────────────────────────────────────
 
 async def init_db() -> None:
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
         for stmt in _SCHEMA.strip().split(";"):
             s = stmt.strip()
@@ -85,21 +87,19 @@ async def save_result(
     period: str,
     draw_time: str,
     full_number: str,
-    depan: str,
-    tengah: str,
-    belakang: str,
-    belakang_bk: str,
-    belakang_gj: str,
+    target_position: str,
+    target_number_2d: str,
+    target_bk: str,
+    target_gj: str,
 ) -> bool:
     """Simpan hasil draw baru. Return True jika berhasil insert, False jika duplikat."""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """INSERT OR IGNORE INTO results
                (period, draw_time, full_number,
-                number_2d_depan, number_2d_tengah, number_2d_belakang,
-                belakang_bk, belakang_gj)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (period, draw_time, full_number, depan, tengah, belakang, belakang_bk, belakang_gj),
+                target_position, target_number_2d, target_bk, target_gj)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (period, draw_time, full_number, target_position, target_number_2d, target_bk, target_gj),
         )
         await db.commit()
         return cur.rowcount > 0
@@ -136,6 +136,7 @@ async def result_exists(period: str) -> bool:
 
 async def save_bet(
     period: str,
+    target_position: str,
     dimension: str,          # "besar_kecil" | "genap_ganjil"
     choice: str,             # "BE" | "KE" | "GE" | "GA"
     bet_amount_per_angka: int,
@@ -148,11 +149,11 @@ async def save_bet(
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """INSERT INTO bets
-               (period, bet_dimension, bet_choice,
+               (period, target_position, bet_dimension, bet_choice,
                 bet_amount_per_angka, total_amount,
                 martingale_level, confidence, api_response)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (period, dimension, choice,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (period, target_position, dimension, choice,
              bet_amount_per_angka, total_amount,
              martingale_level, confidence, api_response),
         )

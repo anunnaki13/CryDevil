@@ -7,7 +7,14 @@ from telegram import Bot
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from config import (
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
+    TELEGRAM_MESSAGE_THREAD_ID,
+    INSTANCE_LABEL,
+    BET_TARGET,
+    BET_MODE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,42 +36,60 @@ class TelegramNotifier:
             logger.info("[Telegram] %s", text)
             return
         try:
-            await self._bot.send_message(
-                chat_id=self._chat_id,
-                text=text,
-                parse_mode=ParseMode.HTML,
-            )
+            payload = {
+                "chat_id": self._chat_id,
+                "text": text,
+                "parse_mode": ParseMode.HTML,
+            }
+            if TELEGRAM_MESSAGE_THREAD_ID is not None:
+                payload["message_thread_id"] = TELEGRAM_MESSAGE_THREAD_ID
+            await self._bot.send_message(**payload)
         except TelegramError as e:
             logger.error("Telegram gagal kirim: %s", e)
+
+    def _title(self, text: str) -> str:
+        return f"[{INSTANCE_LABEL}] {text}"
 
     # ─── Bet placed ──────────────────────────────────────────────────────────
 
     async def notify_bet_placed(
         self,
         periode: str,
-        bk_choice: str,        # "BE" | "KE"
-        gj_choice: str,        # "GE" | "GA"
-        bk_confidence: float,
-        gj_confidence: float,
-        bet_amount: int,       # per angka (IDR)
-        bk_level: int,
-        gj_level: int,
+        bk_choice: Optional[str],        # "BE" | "KE"
+        gj_choice: Optional[str],        # "GE" | "GA"
+        bk_confidence: Optional[float],
+        gj_confidence: Optional[float],
+        bk_amount: int,
+        gj_amount: int,
+        bk_level: Optional[int],
+        gj_level: Optional[int],
         dry_run: bool = False,
     ) -> None:
         mode       = "[DRY RUN] " if dry_run else ""
-        total      = bet_amount * 50 * 2
         bk_labels  = {"BE": "BESAR", "KE": "KECIL"}
         gj_labels  = {"GE": "GENAP", "GA": "GANJIL"}
+        lines = [
+            f"{mode}🎯 {self._title(f'BET Periode {periode}')}",
+            f"Posisi: 2D {BET_TARGET.title()} | Mode: {BET_MODE}",
+        ]
 
-        text = (
-            f"{mode}🎯 BET Periode {periode}\n"
-            f"Posisi: 2D Belakang\n"
-            f"Besar/Kecil : <b>{bk_labels[bk_choice]}</b> (confidence: {bk_confidence:.0%}) — Level {bk_level}\n"
-            f"Genap/Ganjil: <b>{gj_labels[gj_choice]}</b> (confidence: {gj_confidence:.0%}) — Level {gj_level}\n"
-            f"Bet: Rp{bet_amount:,}/angka × 50 = Rp{bet_amount*50:,} per taruhan\n"
-            f"Total: Rp{total:,} (2 taruhan)"
-        )
-        await self._send(text)
+        total = 0
+        if bk_choice is not None and bk_confidence is not None and bk_level is not None:
+            total += bk_amount * 50
+            lines.append(
+                f"Besar/Kecil : <b>{bk_labels[bk_choice]}</b> (confidence: {bk_confidence:.0%}) — "
+                f"Level {bk_level} — Rp{bk_amount:,}/angka × 50 = Rp{bk_amount*50:,}"
+            )
+
+        if gj_choice is not None and gj_confidence is not None and gj_level is not None:
+            total += gj_amount * 50
+            lines.append(
+                f"Genap/Ganjil: <b>{gj_labels[gj_choice]}</b> (confidence: {gj_confidence:.0%}) — "
+                f"Level {gj_level} — Rp{gj_amount:,}/angka × 50 = Rp{gj_amount*50:,}"
+            )
+
+        lines.append(f"Total: Rp{total:,}")
+        await self._send("\n".join(lines))
 
     # ─── Result ──────────────────────────────────────────────────────────────
 
@@ -104,7 +129,7 @@ class TelegramNotifier:
         balance_line = f" | Saldo: Rp{balance:,}" if balance else ""
 
         text = (
-            f"📊 HASIL Periode {periode}: <b>{full_result}</b> (2D={result_2d})\n"
+            f"📊 {self._title(f'HASIL Periode {periode}')}: <b>{full_result}</b> (2D {BET_TARGET}={result_2d})\n"
             f"→ {bk_line}\n"
             f"→ {gj_line}\n"
             f"Profit: {profit_str}{balance_line}"
@@ -128,7 +153,7 @@ class TelegramNotifier:
         bal_line   = f" | Saldo: Rp{ending_balance:,}" if ending_balance else ""
 
         text = (
-            f"📈 Ringkasan Hari Ini — {date}\n"
+            f"📈 {self._title('Ringkasan Hari Ini')} — {date}\n"
             f"Periode: {total_bets} bet | Win: {total_wins}/{total_bets} ({win_rate:.1f}%)\n"
             f"Total Bet: Rp{total_bet_amount:,} | Total Win: Rp{total_win_amount:,}\n"
             f"Profit: {profit_str}{bal_line}"
@@ -138,18 +163,22 @@ class TelegramNotifier:
     # ─── Misc ────────────────────────────────────────────────────────────────
 
     async def notify_alert(self, message: str) -> None:
-        await self._send(f"⚠️ <b>Alert</b>\n{message}")
+        await self._send(f"⚠️ <b>{self._title('Alert')}</b>\n{message}")
 
     async def send_startup(self, dry_run: bool = False) -> None:
         mode = " [DRY RUN MODE]" if dry_run else ""
-        await self._send(f"🤖 <b>Hokidraw Bot Aktif{mode}</b>\nMenunggu draw pertama...")
+        await self._send(
+            f"🤖 <b>{self._title(f'Hokidraw Bot Aktif{mode}')}</b>\n"
+            f"Posisi: 2D {BET_TARGET.title()} | Mode: {BET_MODE}\n"
+            f"Menunggu draw pertama..."
+        )
 
     async def send_shutdown(self) -> None:
-        await self._send("🛑 <b>Hokidraw Bot Berhenti</b>")
+        await self._send(f"🛑 <b>{self._title('Hokidraw Bot Berhenti')}</b>")
 
     async def send_limit_reached(self, daily_loss: int, limit: int) -> None:
         await self._send(
-            f"🚫 <b>Limit Rugi Harian Tercapai</b>\n"
+            f"🚫 <b>{self._title('Limit Rugi Harian Tercapai')}</b>\n"
             f"Rugi: Rp{daily_loss:,} / Limit: Rp{limit:,}\n"
             f"Bot berhenti sampai tengah malam WIB."
         )

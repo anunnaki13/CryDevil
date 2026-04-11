@@ -25,11 +25,12 @@ from telegram.ext import (
 )
 
 from config import (
-    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_COMMANDS_ENABLED, DB_PATH,
     MARTINGALE_LEVELS, DAILY_LOSS_LIMIT, BASE_BET, BET_MODE,
-    BASE_URL, POOL_ID, LLM_PRIMARY,
+    LLM_PRIMARY, INSTANCE_LABEL, BET_TARGET,
 )
 from modules import database as db
+from modules import fleet
 from modules.auth import AuthManager
 from modules.money_manager import MoneyManager
 
@@ -69,7 +70,7 @@ class TelegramCommands:
         if not self._is_authorized(update):
             return
         text = (
-            "<b>Hokidraw Bot — Command List</b>\n\n"
+            f"<b>{INSTANCE_LABEL} — Command List</b>\n\n"
             "/status   — Status bot & konfigurasi\n"
             "/balance  — Cek saldo akun\n"
             "/history  — 10 bet terakhir\n"
@@ -77,6 +78,9 @@ class TelegramCommands:
             "/stats    — Statistik hari ini\n"
             "/profit   — Profit hari ini & keseluruhan\n"
             "/level    — Level martingale BK & GJ\n"
+            "/bots     — Status fleet bot\n"
+            "/bot_on X — Aktifkan bot tertentu\n"
+            "/bot_off X — Matikan bot tertentu\n"
             "/pause    — Pause bot (skip siklus)\n"
             "/resume   — Resume bot\n"
             "/help     — Tampilkan menu ini"
@@ -98,9 +102,10 @@ class TelegramCommands:
         bal_str = f"Rp{balance:,}" if balance else "?"
 
         text = (
-            f"<b>Status Bot — {now}</b>\n\n"
+            f"<b>Status Bot {INSTANCE_LABEL} — {now}</b>\n\n"
             f"Mode      : {pause_str}\n"
             f"Balance   : {bal_str}\n"
+            f"Target    : 2D {BET_TARGET}\n"
             f"Bet Mode  : {BET_MODE}\n"
             f"Base Bet  : Rp{BASE_BET:,}/angka\n"
             f"LLM       : {LLM_PRIMARY}\n"
@@ -179,8 +184,8 @@ class TelegramCommands:
         for r in results:
             lines.append(
                 f"P{r['period']} | {r['full_number']} | "
-                f"2D={r['number_2d_belakang']} "
-                f"({r['belakang_bk']}/{r['belakang_gj']})"
+                f"2D {r['target_position']}={r['target_number_2d']} "
+                f"({r['target_bk']}/{r['target_gj']})"
             )
 
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
@@ -292,10 +297,43 @@ class TelegramCommands:
         await db.set_state("bot_paused", "0")
         await update.message.reply_text("Bot RESUMED. Siklus berikutnya akan berjalan normal.")
 
+    async def _cmd_bots(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update):
+            return
+        bots = fleet.get_snapshots()
+        lines = ["<b>Status Fleet Bot</b>\n"]
+        for bot_name, snapshot in bots.items():
+            lines.append(
+                f"{bot_name} | {'ON' if snapshot.get('enabled', True) else 'OFF'} | "
+                f"target={snapshot.get('target', '?')} | balance={snapshot.get('balance', '?')} | "
+                f"daily_loss={snapshot.get('daily_loss', 0)}"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def _cmd_bot_on(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update):
+            return
+        if not context.args:
+            await update.message.reply_text("Gunakan: /bot_on bot-2")
+            return
+        bot_name = context.args[0].strip()
+        fleet.set_bot_enabled(bot_name, True)
+        await update.message.reply_text(f"{bot_name} diaktifkan.")
+
+    async def _cmd_bot_off(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update):
+            return
+        if not context.args:
+            await update.message.reply_text("Gunakan: /bot_off bot-2")
+            return
+        bot_name = context.args[0].strip()
+        fleet.set_bot_enabled(bot_name, False)
+        await update.message.reply_text(f"{bot_name} dimatikan.")
+
     # ─── DB helpers ──────────────────────────────────────────────────────────
 
     async def _get_recent_bets(self, limit: int = 10) -> list[dict]:
-        async with __import__("aiosqlite").connect("data/hokidraw.db") as conn:
+        async with __import__("aiosqlite").connect(DB_PATH) as conn:
             conn.row_factory = __import__("aiosqlite").Row
             async with conn.execute(
                 "SELECT * FROM bets ORDER BY id DESC LIMIT ?", (limit,)
@@ -303,7 +341,7 @@ class TelegramCommands:
                 return [dict(r) for r in await cur.fetchall()]
 
     async def _get_all_daily_stats(self) -> list[dict]:
-        async with __import__("aiosqlite").connect("data/hokidraw.db") as conn:
+        async with __import__("aiosqlite").connect(DB_PATH) as conn:
             conn.row_factory = __import__("aiosqlite").Row
             async with conn.execute(
                 "SELECT * FROM daily_stats ORDER BY date DESC"
@@ -314,6 +352,10 @@ class TelegramCommands:
 
     async def start(self) -> None:
         """Start the Telegram command listener (polling)."""
+        if not TELEGRAM_COMMANDS_ENABLED:
+            logger.info("Telegram commands disabled for instance %s", INSTANCE_LABEL)
+            return
+
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             logger.warning("Telegram commands disabled — token/chat_id not set")
             return
@@ -330,6 +372,9 @@ class TelegramCommands:
         self._app.add_handler(CommandHandler("stats", self._cmd_stats))
         self._app.add_handler(CommandHandler("profit", self._cmd_profit))
         self._app.add_handler(CommandHandler("level", self._cmd_level))
+        self._app.add_handler(CommandHandler("bots", self._cmd_bots))
+        self._app.add_handler(CommandHandler("bot_on", self._cmd_bot_on))
+        self._app.add_handler(CommandHandler("bot_off", self._cmd_bot_off))
         self._app.add_handler(CommandHandler("pause", self._cmd_pause))
         self._app.add_handler(CommandHandler("resume", self._cmd_resume))
 
@@ -342,6 +387,9 @@ class TelegramCommands:
             BotCommand("stats", "Statistik hari ini"),
             BotCommand("profit", "Profit hari ini & total"),
             BotCommand("level", "Level martingale BK & GJ"),
+            BotCommand("bots", "Status fleet bot"),
+            BotCommand("bot_on", "Aktifkan bot tertentu"),
+            BotCommand("bot_off", "Matikan bot tertentu"),
             BotCommand("pause", "Pause bot"),
             BotCommand("resume", "Resume bot"),
             BotCommand("help", "Daftar perintah"),

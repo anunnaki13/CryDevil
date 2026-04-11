@@ -32,7 +32,8 @@ from apscheduler.triggers.cron import CronTrigger
 from config import (
     POLL_START_MINUTE, POLL_INTERVAL_SECONDS, MAX_POLL_ATTEMPTS,
     BET_DEADLINE_MINUTE, DAILY_LOSS_LIMIT,
-    LOG_PATH, BET_MODE,
+    LOG_PATH, BET_MODE, BET_TARGET, INSTANCE_LABEL,
+    FLEET_SHARED_ANALYSIS, FLEET_ROLE, INSTANCE_NAME,
     validate_config,
 )
 from modules import database as db
@@ -43,13 +44,16 @@ from modules.bettor import Bettor
 from modules.money_manager import MoneyManager
 from modules.notifier import TelegramNotifier
 from modules.categories import (
-    classify_result, extract_belakang, parse_result_full, result_summary,
+    get_target_result, parse_result_full, result_summary,
 )
 from modules.telegram_commands import TelegramCommands
+from modules import fleet
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
-os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+_log_dir = os.path.dirname(LOG_PATH)
+if _log_dir:
+    os.makedirs(_log_dir, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,11 +90,30 @@ class HokidrawBot:
         self.tg_commands   = TelegramCommands(self.auth, self.mm)
         self._last_period: Optional[str] = None
 
+    async def _publish_snapshot(self, balance: Optional[int] = None) -> None:
+        summary = await self.mm.get_status_summary()
+        fleet.update_snapshot({
+            "instance_label": INSTANCE_LABEL,
+            "target": BET_TARGET,
+            "enabled": fleet.is_bot_enabled(INSTANCE_NAME),
+            "balance": balance if balance is not None else await self.auth.get_balance(),
+            "daily_loss": summary["daily_loss"],
+            "bk_level": summary["bk_level"],
+            "gj_level": summary["gj_level"],
+            "bk_bet": summary["bk_bet"],
+            "gj_bet": summary["gj_bet"],
+            "mode": BET_MODE,
+        })
+
     # ─── Siklus utama ─────────────────────────────────────────────────────────
 
     async def hourly_cycle(self) -> None:
         now = _now_wib()
         logger.info("=== Siklus mulai @ %s ===", now.strftime("%H:%M WIB"))
+
+        if FLEET_SHARED_ANALYSIS and not fleet.is_bot_enabled(INSTANCE_NAME):
+            logger.info("Bot %s dimatikan dari fleet state — skip siklus ini", INSTANCE_NAME)
+            return
 
         # 0. Cek pause
         if self.tg_commands.is_paused:
@@ -102,6 +125,8 @@ class HokidrawBot:
         if not await self.auth.ensure_logged_in():
             await self.notifier.notify_alert("Login gagal — skip siklus ini")
             return
+
+        await self._publish_snapshot()
 
         # 2. Poll hasil draw baru
         result = None
@@ -132,25 +157,11 @@ class HokidrawBot:
             logger.info("Lewat deadline menit :%02d — skip bet", BET_DEADLINE_MINUTE)
             return
 
-        # 6. Ambil history dan prediksi LLM
+        # 6. Ambil history dan prediksi LLM/plan fleet
         history = await self.scraper.get_draw_history()
         if not history:
             await self.notifier.notify_alert("Gagal ambil history draw")
             return
-
-        prediction = await self.predictor.analyze(history)
-        if prediction is None:
-            await self.notifier.notify_alert("LLM prediction gagal")
-            return
-
-        bk_data = prediction["besar_kecil"]
-        gj_data = prediction["genap_ganjil"]
-
-        logger.info(
-            "Prediksi → BK: %s (%.0f%%) | GJ: %s (%.0f%%)",
-            bk_data["choice"], bk_data["confidence"] * 100,
-            gj_data["choice"], gj_data["confidence"] * 100,
-        )
 
         # 7. Ambil periode saat ini
         periode = await self.scraper.get_current_periode()
@@ -162,14 +173,82 @@ class HokidrawBot:
             logger.info("Sudah bet di periode %s — skip", periode)
             return
 
+        if FLEET_SHARED_ANALYSIS:
+            fleet_plan = None
+            if FLEET_ROLE == "leader":
+                snapshots = fleet.get_snapshots()
+                fleet_plan = await self.predictor.analyze_fleet(history, snapshots)
+                if fleet_plan is None:
+                    await self.notifier.notify_alert("LLM fleet analysis gagal")
+                    return
+                fleet.write_plan({
+                    "period": periode,
+                    **fleet_plan,
+                })
+            else:
+                for _ in range(10):
+                    candidate = fleet.read_plan()
+                    if candidate.get("period") == periode:
+                        fleet_plan = candidate
+                        break
+                    await asyncio.sleep(2)
+                if fleet_plan is None:
+                    await self.notifier.notify_alert("Plan fleet belum tersedia untuk periode ini")
+                    return
+
+            my_plan = (fleet_plan.get("bots") or {}).get(INSTANCE_NAME)
+            if not my_plan:
+                logger.warning("Tidak ada plan untuk bot %s", INSTANCE_NAME)
+                return
+            if my_plan.get("target") != BET_TARGET:
+                logger.warning(
+                    "Plan target mismatch untuk %s: expected=%s actual=%s",
+                    INSTANCE_NAME, BET_TARGET, my_plan.get("target")
+                )
+                return
+            if my_plan.get("action") != "BET":
+                logger.info("Plan fleet memutuskan SKIP untuk %s: %s", INSTANCE_NAME, my_plan.get("note", ""))
+                return
+
+            bk_data = my_plan["besar_kecil"]
+            gj_data = my_plan["genap_ganjil"]
+            logger.info(
+                "[%s] Fleet plan %s → BK: %s (%.0f%%) | GJ: %s (%.0f%%) | risk=%s",
+                INSTANCE_LABEL,
+                BET_TARGET,
+                bk_data["choice"], bk_data["confidence"] * 100,
+                gj_data["choice"], gj_data["confidence"] * 100,
+                my_plan.get("mode_risiko", "normal"),
+            )
+        else:
+            prediction = await self.predictor.analyze(history)
+            if prediction is None:
+                await self.notifier.notify_alert("LLM prediction gagal")
+                return
+
+            bk_data = prediction["besar_kecil"]
+            gj_data = prediction["genap_ganjil"]
+
+            logger.info(
+                "[%s] Prediksi %s → BK: %s (%.0f%%) | GJ: %s (%.0f%%)",
+                INSTANCE_LABEL,
+                BET_TARGET,
+                bk_data["choice"], bk_data["confidence"] * 100,
+                gj_data["choice"], gj_data["confidence"] * 100,
+            )
+
         # 8. Ambil bet amount dari money manager (per dimensi)
         bk_amount = await self.mm.get_bet_amount("besar_kecil")
         gj_amount = await self.mm.get_bet_amount("genap_ganjil")
         bk_level  = await self.mm.get_level("besar_kecil")
         gj_level  = await self.mm.get_level("genap_ganjil")
+        effective_bet_mode = BET_MODE
+        if FLEET_SHARED_ANALYSIS and FLEET_ROLE in ("leader", "worker"):
+            if my_plan.get("mode_risiko") == "conservative":
+                effective_bet_mode = "single"
 
         # 9. Pasang bet
-        if BET_MODE == "double":
+        if effective_bet_mode == "double":
             results = await self.bettor.place_double_bet(
                 bk_data["choice"], gj_data["choice"],
                 bk_amount, gj_amount,
@@ -193,16 +272,16 @@ class HokidrawBot:
         await db.set_state("last_period", periode)
 
         # 11. Notifikasi
-        actual_bk_amount = bk_amount if bk_resp else 0
         await self.notifier.notify_bet_placed(
             periode=periode,
-            bk_choice=bk_data["choice"],
-            gj_choice=gj_data["choice"],
-            bk_confidence=bk_data["confidence"],
-            gj_confidence=gj_data["confidence"],
-            bet_amount=bk_amount,  # tampilkan BK amount (biasanya sama)
-            bk_level=bk_level,
-            gj_level=gj_level,
+            bk_choice=bk_data["choice"] if bk_resp else None,
+            gj_choice=gj_data["choice"] if gj_resp else None,
+            bk_confidence=bk_data["confidence"] if bk_resp else None,
+            gj_confidence=gj_data["confidence"] if gj_resp else None,
+            bk_amount=bk_amount,
+            gj_amount=gj_amount,
+            bk_level=bk_level if bk_resp else None,
+            gj_level=gj_level if gj_resp else None,
             dry_run=self.dry_run,
         )
 
@@ -237,32 +316,33 @@ class HokidrawBot:
             logger.error("Tidak bisa parse result: %s", result_4d)
             return
 
-        belakang    = parsed["belakang"]
-        actual_bk   = parsed["belakang_bk"]
-        actual_gj   = parsed["belakang_gj"]
+        target_data = get_target_result(parsed, BET_TARGET)
+        number_2d   = target_data["number_2d"]
+        actual_bk   = target_data["besar_kecil"]
+        actual_gj   = target_data["genap_ganjil"]
 
         logger.info("Result %s: %s → %s", period, result_summary(result_4d),
-                    f"2D={belakang} {actual_bk}+{actual_gj}")
+                    f"{BET_TARGET}=2D {number_2d} {actual_bk}+{actual_gj}")
 
         # Simpan ke DB
         await db.save_result(
             period=period,
             draw_time=draw_time,
             full_number=parsed["full"],
-            depan=parsed["depan"],
-            tengah=parsed["tengah"],
-            belakang=belakang,
-            belakang_bk=actual_bk,
-            belakang_gj=actual_gj,
+            target_position=BET_TARGET,
+            target_number_2d=number_2d,
+            target_bk=actual_bk,
+            target_gj=actual_gj,
         )
 
-        # Settle semua pending bet
-        pending = await db.get_all_placed_bets()
+        # Settle hanya bet untuk periode result ini.
+        # Menggunakan semua pending bets berisiko salah settle jika bot sempat tertinggal beberapa draw.
+        pending = await db.get_placed_bets(period)
         for bet in pending:
             bet_choice = bet["bet_choice"]
             dimension  = bet["bet_dimension"]
             amount     = int(bet["bet_amount_per_angka"])
-            won        = self.bettor.check_win(bet_choice, belakang)
+            won        = self.bettor.check_win(bet_choice, number_2d)
             payout     = self.bettor.calculate_payout(amount, won)
 
             status = "won" if won else "lost"
@@ -270,7 +350,7 @@ class HokidrawBot:
                 bet_id=bet["id"],
                 status=status,
                 win_amount=payout["won"],
-                result_2d=belakang,
+                result_2d=number_2d,
                 result_match=actual_bk if dimension == "besar_kecil" else actual_gj,
             )
 
@@ -286,7 +366,7 @@ class HokidrawBot:
 
         # Notifikasi hasil (aggregasi BK + GJ untuk periode yang sama)
         if pending:
-            await self._notify_result(period, result_4d, belakang,
+            await self._notify_result(period, result_4d, number_2d,
                                       actual_bk, actual_gj, pending)
 
     async def _notify_result(
@@ -346,6 +426,7 @@ class HokidrawBot:
         if bk_resp is not None:
             await db.save_bet(
                 period=periode,
+                target_position=BET_TARGET,
                 dimension="besar_kecil",
                 choice=bk_data["choice"],
                 bet_amount_per_angka=bk_amount,
@@ -358,6 +439,7 @@ class HokidrawBot:
         if gj_resp is not None:
             await db.save_bet(
                 period=periode,
+                target_position=BET_TARGET,
                 dimension="genap_ganjil",
                 choice=gj_data["choice"],
                 bet_amount_per_angka=gj_amount,
@@ -401,6 +483,7 @@ class HokidrawBot:
             sys.exit(1)
         balance = await self.auth.get_balance()
         logger.info("Login OK. Balance: Rp%s", f"{balance:,}" if balance else "?")
+        await self._publish_snapshot(balance=balance)
 
         # Restore last_period dari DB agar tidak bet duplikat setelah restart
         saved_period = await db.get_state("last_period")

@@ -5,8 +5,8 @@
 # ═══════════════════════════════════════════════════════
 set -e
 
-INSTALL_DIR="/opt/hokidraw-bot2"
-SERVICE_NAME="hokidraw-bot2"
+INSTALL_DIR="${INSTALL_DIR:-/opt/hokidraw-bot}"
+SERVICE_NAME="${SERVICE_NAME:-hokidraw-bot}"
 PYTHON="python3.11"
 
 echo ""
@@ -59,8 +59,8 @@ python -m playwright install chromium --with-deps -q 2>/dev/null \
     || echo "      SKIP (Playwright gagal install, bot tetap bisa jalan tanpa ini)"
 
 # ── Direktori data & log ───────────────────────────────
-mkdir -p data logs
-echo "[5/6] Direktori data/ dan logs/ siap."
+mkdir -p data logs instances
+echo "[5/6] Direktori data/, logs/, dan instances/ siap."
 
 # ── File .env ──────────────────────────────────────────
 echo ""
@@ -85,17 +85,21 @@ else
     echo "    TELEGRAM_CHAT_ID    → chat ID Telegram (opsional)"
     echo ""
     echo "  Yang bisa dikustomisasi (sudah ada default):"
-    echo "    BASE_BET            → nominal bet per nomor (default: Rp 1.000)"
-    echo "    NUM_PICKS           → jumlah nomor per periode (default: 5)"
+    echo "    INSTANCE_NAME       → nama unik bot untuk multi-instance"
+    echo "    BET_TARGET          → depan / tengah / belakang"
+    echo "    BASE_BET            → nominal bet per angka"
     echo "    MARTINGALE_LEVELS   → level martingale, pisah koma"
     echo "    DAILY_LOSS_LIMIT    → batas rugi harian (default: Rp 200.000)"
     echo ""
 fi
 
 # ── Systemd service ────────────────────────────────────
-$SUDO cp "$INSTALL_DIR/hokidraw-bot.service" /etc/systemd/system/
+$SUDO cp "$INSTALL_DIR/hokidraw-bot.service" /etc/systemd/system/$SERVICE_NAME.service
+$SUDO cp "$INSTALL_DIR/hokidraw-bot@.service" /etc/systemd/system/hokidraw-bot@.service
 $SUDO sed -i "s|/opt/hokidraw-bot|$INSTALL_DIR|g" /etc/systemd/system/$SERVICE_NAME.service
+$SUDO sed -i "s|/opt/hokidraw-bot|$INSTALL_DIR|g" /etc/systemd/system/hokidraw-bot@.service
 $SUDO sed -i "s|User=ubuntu|User=$USER|g" /etc/systemd/system/$SERVICE_NAME.service
+$SUDO sed -i "s|User=ubuntu|User=$USER|g" /etc/systemd/system/hokidraw-bot@.service
 $SUDO systemctl daemon-reload
 
 # ═══════════════════════════════════════════════════════
@@ -118,6 +122,16 @@ echo "     python main.py --dry-run"
 echo ""
 echo "  4. Jalankan sebagai service (otomatis mulai saat VPS reboot):"
 echo "     sudo systemctl enable --now $SERVICE_NAME"
+echo ""
+echo "  4b. Untuk multi-instance:"
+echo "     mkdir -p $INSTALL_DIR/instances/bot-1 $INSTALL_DIR/instances/bot-2 $INSTALL_DIR/instances/bot-3 $INSTALL_DIR/shared"
+echo "     cp $INSTALL_DIR/instances/bot-template.env $INSTALL_DIR/instances/bot-1/.env"
+echo "     cp $INSTALL_DIR/instances/bot-template.env $INSTALL_DIR/instances/bot-2/.env"
+echo "     cp $INSTALL_DIR/instances/bot-template.env $INSTALL_DIR/instances/bot-3/.env"
+echo "     # bot-1=leader(depan), bot-2=worker(tengah), bot-3=worker(belakang)"
+echo "     sudo systemctl enable --now hokidraw-bot@bot-1"
+echo "     sudo systemctl enable --now hokidraw-bot@bot-2"
+echo "     sudo systemctl enable --now hokidraw-bot@bot-3"
 echo ""
 echo "  5. Cek status & log:"
 echo "     sudo systemctl status $SERVICE_NAME"

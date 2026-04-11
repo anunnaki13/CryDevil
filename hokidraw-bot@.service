@@ -1,18 +1,18 @@
 [Unit]
-Description=Hokidraw 2D Lottery Bot (single instance)
+Description=Hokidraw 2D Lottery Bot (%i)
 After=network.target
 
 [Service]
 Type=simple
 User=ubuntu
 WorkingDirectory=/opt/hokidraw-bot
-EnvironmentFile=/opt/hokidraw-bot/.env
+EnvironmentFile=/opt/hokidraw-bot/instances/%i/.env
 ExecStart=/opt/hokidraw-bot/venv/bin/python main.py
 Restart=on-failure
 RestartSec=30
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=hokidraw-bot
+SyslogIdentifier=hokidraw-bot-%i
 
 [Install]
 WantedBy=multi-user.target

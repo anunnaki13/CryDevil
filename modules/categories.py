@@ -1,5 +1,5 @@
 """
-Klasifikasi hasil 2D Belakang ke kategori Besar/Kecil dan Genap/Ganjil.
+Klasifikasi hasil 2D ke kategori Besar/Kecil dan Genap/Ganjil.
 
 Aturan (sesuai blueprint):
   Besar/Kecil → nilai KESELURUHAN angka 2D:
@@ -88,16 +88,40 @@ def parse_result_full(result_4d: str) -> dict | None:
         return None
     digits = digits[-4:]
 
+    depan    = digits[0:2]
+    tengah   = digits[1:3]
     belakang = digits[2:4]
-    cat      = classify_result(belakang)
+    depan_cat = classify_result(depan)
+    tengah_cat = classify_result(tengah)
+    belakang_cat = classify_result(belakang)
 
     return {
         "full":         digits,
-        "depan":        digits[0:2],
-        "tengah":       digits[1:3],
+        "depan":        depan,
+        "tengah":       tengah,
         "belakang":     belakang,
-        "belakang_bk":  cat["besar_kecil"],
-        "belakang_gj":  cat["genap_ganjil"],
+        "depan_bk":     depan_cat["besar_kecil"],
+        "depan_gj":     depan_cat["genap_ganjil"],
+        "tengah_bk":    tengah_cat["besar_kecil"],
+        "tengah_gj":    tengah_cat["genap_ganjil"],
+        "belakang_bk":  belakang_cat["besar_kecil"],
+        "belakang_gj":  belakang_cat["genap_ganjil"],
+    }
+
+
+def get_target_result(parsed: dict, target: str) -> dict:
+    """
+    Ambil 2D dan kategorinya berdasarkan target posisi:
+      depan | tengah | belakang
+    """
+    if target not in ("depan", "tengah", "belakang"):
+        raise ValueError(f"Target posisi tidak valid: {target}")
+
+    return {
+        "position": target,
+        "number_2d": parsed[target],
+        "besar_kecil": parsed[f"{target}_bk"],
+        "genap_ganjil": parsed[f"{target}_gj"],
     }
 
 

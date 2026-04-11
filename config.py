@@ -41,6 +41,13 @@ def _int_list(key: str, default: list[int]) -> list[int]:
     raw = os.getenv(key, "").strip()
     if not raw:
         return default
+
+
+def _str_list(key: str, default: list[str]) -> list[str]:
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        return default
+    return [x.strip() for x in raw.split(",") if x.strip()]
     try:
         return [int(x.strip()) for x in raw.split(",") if x.strip()]
     except ValueError:
@@ -54,11 +61,17 @@ def _int_list(key: str, default: list[int]) -> list[int]:
 _errors: list[str] = []
 _warnings: list[str] = []
 
+# ─── 0. Instance identity ─────────────────────────────────────────────────────
+INSTANCE_NAME = _optional("INSTANCE_NAME", "bot-1")
+INSTANCE_LABEL = _optional("INSTANCE_LABEL", INSTANCE_NAME)
+
+
 # ─── 1. Website ───────────────────────────────────────────────────────────────
 BASE_URL  = _optional("SITE_URL", "https://partai34848.com").rstrip("/")
 POOL_ID   = _optional("POOL_ID",  "p76368")
 GAME_TYPE = "quick_2d"
-BET_POSISI = "belakang"
+BET_TARGET = _optional("BET_TARGET", "belakang").lower()
+BET_POSISI = BET_TARGET
 
 # ─── 2. Kredensial ────────────────────────────────────────────────────────────
 USERNAME = _require("PARTAI_USERNAME")
@@ -113,8 +126,18 @@ MAX_MARTINGALE_LEVEL      = len(MARTINGALE_LEVELS) - 1
 DAILY_LOSS_LIMIT = _int("DAILY_LOSS_LIMIT", 200_000)
 
 # ─── 7. Telegram ─────────────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "").strip()
+TELEGRAM_BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID          = os.getenv("TELEGRAM_CHAT_ID",   "").strip()
+TELEGRAM_THREAD_ID_RAW    = os.getenv("TELEGRAM_MESSAGE_THREAD_ID", "").strip()
+TELEGRAM_COMMANDS_ENABLED = _optional("TELEGRAM_COMMANDS_ENABLED", "false").lower() in (
+    "1", "true", "yes", "on"
+)
+
+try:
+    TELEGRAM_MESSAGE_THREAD_ID = int(TELEGRAM_THREAD_ID_RAW) if TELEGRAM_THREAD_ID_RAW else None
+except ValueError:
+    _warnings.append("  [WARNING] TELEGRAM_MESSAGE_THREAD_ID harus berupa angka bulat, diabaikan")
+    TELEGRAM_MESSAGE_THREAD_ID = None
 
 # ─── 8. Timing ───────────────────────────────────────────────────────────────
 POLL_START_MINUTE         = _int("BET_START_MINUTE",    5)
@@ -132,8 +155,15 @@ SESSION_VALIDATION_INTERVAL = _int("SESSION_CHECK_INTERVAL", 1_800)
 TIMER_API_URL = "https://jampasaran.smbgroup.io/pasaran"
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
-DB_PATH  = "data/hokidraw.db"
-LOG_PATH = "logs/bot.log"
+STATE_DIR = _optional("STATE_DIR", ".")
+DB_PATH   = _optional("DB_PATH",  os.path.join(STATE_DIR, "data", "hokidraw.db"))
+LOG_PATH  = _optional("LOG_PATH", os.path.join(STATE_DIR, "logs", "bot.log"))
+FLEET_SHARED_DIR = _optional("FLEET_SHARED_DIR", os.path.join(STATE_DIR, "shared"))
+FLEET_SHARED_ANALYSIS = _optional("FLEET_SHARED_ANALYSIS", "false").lower() in (
+    "1", "true", "yes", "on"
+)
+FLEET_ROLE = _optional("FLEET_ROLE", "solo").lower()
+FLEET_BOT_NAMES = _str_list("FLEET_BOT_NAMES", ["bot-1", "bot-2", "bot-3"])
 
 # ─── Browser headers (anti-Cloudflare) ───────────────────────────────────────
 HEADERS = {
@@ -197,6 +227,21 @@ def validate_config(exit_on_error: bool = True) -> bool:
     if BET_MODE not in ("single", "double"):
         logic_errors.append(f"  BET_MODE='{BET_MODE}' tidak valid. Pilih: single atau double")
 
+    if BET_TARGET not in ("depan", "tengah", "belakang"):
+        logic_errors.append(
+            f"  BET_TARGET='{BET_TARGET}' tidak valid. Pilih: depan, tengah, atau belakang"
+        )
+
+    if FLEET_ROLE not in ("solo", "leader", "worker"):
+        logic_errors.append(
+            f"  FLEET_ROLE='{FLEET_ROLE}' tidak valid. Pilih: solo, leader, atau worker"
+        )
+
+    if FLEET_SHARED_ANALYSIS and FLEET_ROLE == "solo":
+        logic_errors.append(
+            "  FLEET_SHARED_ANALYSIS aktif tetapi FLEET_ROLE masih 'solo'. Gunakan leader atau worker"
+        )
+
     if logic_errors:
         print("\n  Error konfigurasi:")
         for e in logic_errors:
@@ -209,11 +254,12 @@ def validate_config(exit_on_error: bool = True) -> bool:
         print("\n" + "=" * 60)
         print("  KONFIGURASI AKTIF")
         print("=" * 60)
+        print(f"  Instance     : {INSTANCE_LABEL} ({INSTANCE_NAME})")
         print(f"  Website      : {BASE_URL}")
         print(f"  Pool ID      : {POOL_ID}")
         print(f"  Username     : {USERNAME}")
         print(f"  LLM Model    : {LLM_PRIMARY}")
-        print(f"  Posisi       : 2D Belakang")
+        print(f"  Posisi       : 2D {BET_TARGET.title()}")
         print(f"  Bet/angka    : Rp{BASE_BET:,}  |  bet param: {BASE_BET/1000}  |  Tipe: BET FULL (B)  |  Mode: {BET_MODE}")
         print(f"  Total/round  : Rp{total:,}  (50 angka × {'2 bet' if BET_MODE=='double' else '1 bet'} × Rp{BASE_BET:,})")
         print(f"  Pot. menang  : Rp{BASE_BET * 100:,}/bet (100x)")
@@ -222,7 +268,13 @@ def validate_config(exit_on_error: bool = True) -> bool:
         print(f"  Naik level   : setiap {MARTINGALE_STEP_LOSSES} kalah berturut (BK & GJ TERPISAH)")
         print(f"  Limit/hari   : Rp{DAILY_LOSS_LIMIT:,}")
         print(f"  Jadwal       : setiap jam di menit :{POLL_START_MINUTE:02d}")
+        print(f"  DB Path      : {DB_PATH}")
+        print(f"  Log Path     : {LOG_PATH}")
+        print(f"  Fleet Mode   : {'aktif' if FLEET_SHARED_ANALYSIS else 'nonaktif'}")
+        print(f"  Fleet Role   : {FLEET_ROLE}")
+        print(f"  Shared Dir   : {FLEET_SHARED_DIR}")
         print(f"  Telegram     : {'aktif' if TELEGRAM_BOT_TOKEN else 'nonaktif'}")
+        print(f"  Commands TG  : {'aktif' if TELEGRAM_COMMANDS_ENABLED else 'nonaktif'}")
         print("=" * 60 + "\n")
 
     if not ok and exit_on_error:

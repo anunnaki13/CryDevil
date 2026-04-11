@@ -1,20 +1,23 @@
-#  Bot
+# CryDevil
 
-Bot otomatis untuk memasang taruhan **2D Belakang (Besar/Kecil + Genap/Ganjil)** pada pasaran Hokidraw.
+Bot otomatis untuk memasang taruhan **2D Hokidraw** pada posisi **depan**, **tengah**, atau **belakang**.
+Untuk setiap posisi 2D, bot menganalisis dua dimensi taruhan independen: **Besar/Kecil** dan **Genap/Ganjil**.
 Menggunakan **OpenRouter LLM** untuk analisis pola dan prediksi, **Telegram** untuk notifikasi real-time.
 
 ---
 
 ## Mekanisme Permainan
 
-Hokidraw menghasilkan 4 digit angka per draw. Bot fokus pada **2D Belakang** (2 digit terakhir).
+Hokidraw menghasilkan 4 digit angka per draw. Dari 4 digit itu terbentuk 3 posisi 2D:
 
 ```
 Contoh hasil: 1 2 9 5
-                    └─┘ ← 2D Belakang = "95"  ← FOKUS BOT
+              └─┘      ← 2D Depan    = "12"
+                └─┘    ← 2D Tengah   = "29"
+                  └─┘  ← 2D Belakang = "95"
 ```
 
-Angka 2D Belakang diklasifikasikan ke **2 dimensi independen**:
+Setiap posisi 2D diklasifikasikan ke **2 dimensi independen**:
 
 | Dimensi | Aturan | Contoh "95" |
 |---|---|---|
@@ -65,10 +68,13 @@ Outcome (BK dan GJ independen, masing-masing 50% win rate):
 
 - **Prediksi LLM** — analisis 200 hasil terakhir via OpenRouter (Gemini 2.0 Flash / Claude sebagai fallback)
 - **Betting Full** — selalu Quick 2D Bet Full (payout ×100), 2 bet per periode (BK + GJ)
+- **3 Posisi Target** — satu instance bot bisa difokuskan ke `depan`, `tengah`, atau `belakang`
 - **Martingale Terpisah** — level BK dan GJ dikelola **sendiri-sendiri**, menang salah satu tidak reset yang lain
 - **5 Level Martingale** — Rp100 → Rp200 → Rp400 → Rp800 → Rp1.600/angka
 - **Daily Loss Limit** — bot pause otomatis jika rugi harian melebihi batas, resume besok
 - **Notifikasi Telegram** — setiap bet, hasil menang/kalah, dan summary harian 23:55 WIB
+- **Multi-Instance Ready** — bisa jalankan banyak bot di 1 VPS dengan akun, DB, dan log terpisah
+- **Shared Telegram** — semua instance bisa kirim laporan ke 1 bot Telegram yang sama, dengan label instance
 - **Telegram Commands** — kontrol bot via Telegram: cek status, balance, riwayat, profit, pause/resume
 - **Cloudflare Bypass** — httpx dengan browser headers; Playwright headless Chromium sebagai fallback
 - **Dry-run Mode** — simulasi penuh tanpa bet sungguhan
@@ -154,6 +160,7 @@ nano /opt/hokidraw-bot/.env
 
 | Setting | Default | Keterangan |
 |---|---|---|
+| `BET_TARGET` | `belakang` | Posisi target 2D: `depan`, `tengah`, atau `belakang` |
 | `BASE_BET` | `100` | Nominal per **angka** (IDR). `bet_param = BASE_BET ÷ 1.000` yang dikirim ke API |
 | `BET_MODE` | `double` | `double` = 2 bet/periode (BK+GJ) · `single` = 1 bet terkuat |
 
@@ -194,6 +201,8 @@ nano /opt/hokidraw-bot/.env
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | Token dari @BotFather di Telegram |
 | `TELEGRAM_CHAT_ID` | ID chat tujuan notifikasi |
+| `TELEGRAM_MESSAGE_THREAD_ID` | Opsional, jika ingin kirim ke topic/thread tertentu |
+| `TELEGRAM_COMMANDS_ENABLED` | `true/false`. Aktifkan command polling hanya di 1 instance |
 
 > **Cara dapat CHAT_ID:** Kirim pesan ke bot Anda → buka
 > `https://api.telegram.org/bot<TOKEN>/getUpdates` → cari `"chat":{"id": ...}`
@@ -241,6 +250,65 @@ python main.py --dry-run
 python main.py
 ```
 
+## Menjalankan 3 Bot di 1 VPS Dengan 1 Analisa LLM
+
+Struktur yang disarankan:
+
+```bash
+/opt/hokidraw-bot/
+├── venv/
+├── main.py
+├── instances/
+│   ├── bot-1/.env
+│   ├── bot-2/.env
+│   ├── bot-3/.env
+│   └── bot-3/.env
+```
+
+Rancangan final 3 bot:
+
+| Instance | Akun Website | Posisi |
+|---|---|---|
+| `bot-1` | akun A | `depan` |
+| `bot-2` | akun B | `tengah` |
+| `bot-3` | akun C | `belakang` |
+
+Peran fleet:
+
+| Instance | Role | Tugas |
+|---|---|---|
+| `bot-1` | `leader` | Memanggil LLM sekali per periode, menulis rencana fleet |
+| `bot-2` | `worker` | Membaca rencana leader lalu eksekusi pada akun B |
+| `bot-3` | `worker` | Membaca rencana leader lalu eksekusi pada akun C |
+
+Contoh isi penting per instance:
+
+```bash
+INSTANCE_NAME=bot-1
+INSTANCE_LABEL=Bot 1
+BET_TARGET=depan
+PARTAI_USERNAME=akun_a
+PARTAI_PASSWORD=xxxx
+STATE_DIR=/opt/hokidraw-bot/instances/bot-1
+DB_PATH=/opt/hokidraw-bot/instances/bot-1/data/hokidraw.db
+LOG_PATH=/opt/hokidraw-bot/instances/bot-1/logs/bot.log
+FLEET_SHARED_ANALYSIS=true
+FLEET_ROLE=leader
+FLEET_SHARED_DIR=/opt/hokidraw-bot/shared
+FLEET_BOT_NAMES=bot-1,bot-2,bot-3
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+TELEGRAM_COMMANDS_ENABLED=true
+```
+
+Jika semua bot memakai 1 bot Telegram yang sama:
+- gunakan `TELEGRAM_BOT_TOKEN` dan `TELEGRAM_CHAT_ID` yang sama di semua instance
+- biarkan `INSTANCE_LABEL` berbeda agar laporan mudah dibedakan
+- aktifkan `TELEGRAM_COMMANDS_ENABLED=true` hanya pada leader
+- sisanya tetap `false` agar tidak bentrok polling Telegram
+- leader akan memanggil LLM sekali, lalu worker membaca plan bersama dari `FLEET_SHARED_DIR`
+- Anda bisa mematikan bot tertentu dari Telegram dengan `/bot_off bot-2` lalu menyalakannya lagi dengan `/bot_on bot-2`
+
 ### Sebagai Systemd Service (Background, Auto-restart)
 
 ```bash
@@ -261,6 +329,34 @@ sudo systemctl restart hokidraw-bot   # wajib setelah edit .env
 # Update dari GitHub
 cd /opt/hokidraw-bot && git pull origin main
 sudo systemctl restart hokidraw-bot
+```
+
+### Multi-Instance Dengan Systemd Template
+
+```bash
+sudo mkdir -p /opt/hokidraw-bot/instances/bot-1
+cp /opt/hokidraw-bot/instances/bot-template.env /opt/hokidraw-bot/instances/bot-1/.env
+nano /opt/hokidraw-bot/instances/bot-1/.env
+
+sudo systemctl enable --now hokidraw-bot@bot-1
+sudo systemctl status hokidraw-bot@bot-1
+journalctl -u hokidraw-bot@bot-1 -f
+```
+
+Contoh 3 bot:
+
+```bash
+sudo mkdir -p /opt/hokidraw-bot/instances/bot-1 /opt/hokidraw-bot/instances/bot-2 /opt/hokidraw-bot/instances/bot-3 /opt/hokidraw-bot/shared
+cp /opt/hokidraw-bot/instances/bot-template.env /opt/hokidraw-bot/instances/bot-1/.env
+cp /opt/hokidraw-bot/instances/bot-template.env /opt/hokidraw-bot/instances/bot-2/.env
+cp /opt/hokidraw-bot/instances/bot-template.env /opt/hokidraw-bot/instances/bot-3/.env
+
+# edit:
+# bot-1 => target=depan, role=leader, commands=true
+# bot-2 => target=tengah, role=worker, commands=false
+# bot-3 => target=belakang, role=worker, commands=false
+
+sudo systemctl enable --now hokidraw-bot@bot-1 hokidraw-bot@bot-2 hokidraw-bot@bot-3
 ```
 
 ---
