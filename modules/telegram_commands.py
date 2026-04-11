@@ -11,7 +11,6 @@ Commands:
   /profit        — profit hari ini & total
   /level         — level martingale BK & GJ saat ini
   /signal        — snapshot prediksi terakhir
-  /predict       — trigger prediksi LLM (tanpa bet)
   /pause         — pause bot (skip siklus)
   /resume        — resume bot
 """
@@ -19,7 +18,7 @@ Commands:
 import json
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from telegram import Update, BotCommand
 from telegram.ext import (
@@ -30,11 +29,14 @@ from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_COMMANDS_ENABLED, DB_PATH,
     MARTINGALE_LEVELS, DAILY_LOSS_LIMIT, BASE_BET, BET_MODE,
     LLM_PRIMARY, INSTANCE_LABEL, BET_TARGET, FLEET_BOT_NAMES,
+    TELEGRAM_PREDICT_COOLDOWN_SECONDS,
 )
 from modules import database as db
 from modules import fleet
 from modules.auth import AuthManager
 from modules.money_manager import MoneyManager
+from modules.predictor import Predictor
+from modules.scraper import Scraper
 
 logger = logging.getLogger(__name__)
 
@@ -65,11 +67,22 @@ def _net(value: int | float | None) -> str:
 class TelegramCommands:
     """Handles incoming Telegram commands alongside the existing notifier."""
 
-    def __init__(self, auth: AuthManager, money_manager: MoneyManager) -> None:
+    def __init__(
+        self,
+        auth: AuthManager,
+        money_manager: MoneyManager,
+        scraper: Optional[Scraper] = None,
+        predictor: Optional[Predictor] = None,
+        signal_snapshot_writer: Optional[Callable[..., Awaitable[None]]] = None,
+    ) -> None:
         self._auth = auth
         self._mm = money_manager
+        self._scraper = scraper
+        self._predictor = predictor
+        self._signal_snapshot_writer = signal_snapshot_writer
         self._app: Optional[Application] = None
         self._paused = False
+        self._last_predict_at: Optional[datetime] = None
 
     @property
     def is_paused(self) -> bool:
@@ -98,6 +111,7 @@ class TelegramCommands:
             "/profit   — Ringkasan profit bot\n"
             "/level    — Level martingale BK & GJ\n"
             "/signal   — Snapshot prediksi terakhir\n"
+            "/predict  — Analisis manual tanpa pasang bet\n"
             "/bots     — Status fleet bot\n"
             "/bot_on X — Aktifkan bot tertentu\n"
             "/bot_off X — Matikan bot tertentu\n"
@@ -119,7 +133,7 @@ class TelegramCommands:
         now = _now_wib().strftime("%H:%M:%S WIB")
 
         pause_str = "PAUSED" if self._paused else "AKTIF"
-        bal_str = f"Rp{balance:,}" if balance else "?"
+        bal_str = f"Rp{balance:,}" if balance is not None else "?"
 
         text = (
             f"<b>Status Bot {INSTANCE_LABEL} — {now}</b>\n\n"
@@ -339,6 +353,80 @@ class TelegramCommands:
         )
         await update.message.reply_text(text, parse_mode="HTML")
 
+    async def _cmd_predict(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update):
+            return
+
+        if self._scraper is None or self._predictor is None or self._signal_snapshot_writer is None:
+            await update.message.reply_text("Predictor manual belum terhubung di instance ini.")
+            return
+
+        now = datetime.now(timezone.utc)
+        if self._last_predict_at is not None:
+            elapsed = (now - self._last_predict_at).total_seconds()
+            if elapsed < TELEGRAM_PREDICT_COOLDOWN_SECONDS:
+                wait_seconds = int(TELEGRAM_PREDICT_COOLDOWN_SECONDS - elapsed)
+                await update.message.reply_text(
+                    f"/predict masih cooldown. Coba lagi dalam {wait_seconds} detik."
+                )
+                return
+        self._last_predict_at = now
+
+        await update.message.reply_text("Menjalankan analisis manual. Tidak ada bet yang akan dipasang.")
+
+        if not await self._auth.ensure_logged_in():
+            self._last_predict_at = None
+            await update.message.reply_text("Login gagal atau sesi expired. Coba lagi setelah sesi pulih.")
+            return
+
+        history = await self._scraper.get_draw_history()
+        if not history:
+            self._last_predict_at = None
+            await update.message.reply_text("Gagal ambil history draw.")
+            return
+
+        periode = await self._scraper.get_current_periode()
+        if not periode:
+            self._last_predict_at = None
+            await update.message.reply_text("Gagal ambil periode saat ini.")
+            return
+
+        prediction = await self._predictor.analyze(history)
+        if prediction is None:
+            self._last_predict_at = None
+            await update.message.reply_text("Prediksi gagal.")
+            return
+
+        bk = prediction["besar_kecil"]
+        gj = prediction["genap_ganjil"]
+        selected_dim = "besar_kecil" if bk["confidence"] >= gj["confidence"] else "genap_ganjil"
+        selected = bk if selected_dim == "besar_kecil" else gj
+
+        await self._signal_snapshot_writer(
+            periode,
+            bk,
+            gj,
+            source="manual",
+            decision="ANALYZED",
+            selected_dimension=selected_dim,
+            selected_choice=selected["choice"],
+            selected_confidence=selected["confidence"],
+            note="manual_predict",
+        )
+
+        text = (
+            f"<b>Manual Predict</b>\n\n"
+            f"Periode   : {periode}\n"
+            f"Target    : 2D {BET_TARGET}\n"
+            f"BK        : {bk['choice']} | {float(bk['confidence']):.0%}\n"
+            f"Reason BK : {bk.get('reason', '-')}\n\n"
+            f"GJ        : {gj['choice']} | {float(gj['confidence']):.0%}\n"
+            f"Reason GJ : {gj.get('reason', '-')}\n\n"
+            f"Selected  : {selected_dim} | {selected['choice']} | {float(selected['confidence']):.0%}\n"
+            f"Snapshot  : tersimpan, cek /signal"
+        )
+        await update.message.reply_text(text, parse_mode="HTML")
+
     # ─── /pause & /resume ────────────────────────────────────────────────────
 
     async def _cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -434,6 +522,7 @@ class TelegramCommands:
         self._app.add_handler(CommandHandler("profit", self._cmd_profit))
         self._app.add_handler(CommandHandler("level", self._cmd_level))
         self._app.add_handler(CommandHandler("signal", self._cmd_signal))
+        self._app.add_handler(CommandHandler("predict", self._cmd_predict))
         self._app.add_handler(CommandHandler("bots", self._cmd_bots))
         self._app.add_handler(CommandHandler("bot_on", self._cmd_bot_on))
         self._app.add_handler(CommandHandler("bot_off", self._cmd_bot_off))
@@ -450,6 +539,7 @@ class TelegramCommands:
             BotCommand("profit", "Ringkasan profit bot"),
             BotCommand("level", "Level martingale BK & GJ"),
             BotCommand("signal", "Snapshot prediksi terakhir"),
+            BotCommand("predict", "Analisis manual tanpa bet"),
             BotCommand("bots", "Status fleet bot"),
             BotCommand("bot_on", "Aktifkan bot tertentu"),
             BotCommand("bot_off", "Matikan bot tertentu"),

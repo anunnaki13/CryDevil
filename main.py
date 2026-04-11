@@ -89,7 +89,13 @@ class HokidrawBot:
         self.bettor        = Bettor(self.auth)
         self.mm            = MoneyManager()
         self.notifier      = TelegramNotifier()
-        self.tg_commands   = TelegramCommands(self.auth, self.mm)
+        self.tg_commands   = TelegramCommands(
+            self.auth,
+            self.mm,
+            scraper=self.scraper,
+            predictor=self.predictor,
+            signal_snapshot_writer=self._store_signal_snapshot,
+        )
         self._last_period: Optional[str] = None
 
     @staticmethod
@@ -307,6 +313,17 @@ class HokidrawBot:
 
         # 9. Pasang bet
         if effective_bet_mode == "double":
+            await self._store_signal_snapshot(
+                periode,
+                bk_data,
+                gj_data,
+                source="fleet" if FLEET_SHARED_ANALYSIS else "single",
+                decision="BET",
+                selected_dimension="double",
+                selected_choice=f"BK:{bk_data['choice']} | GJ:{gj_data['choice']}",
+                selected_confidence=max(bk_data["confidence"], gj_data["confidence"]),
+                note="double_mode",
+            )
             results = await self.bettor.place_double_bet(
                 bk_data["choice"], gj_data["choice"],
                 bk_amount, gj_amount,
