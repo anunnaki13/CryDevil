@@ -64,6 +64,25 @@ def _net(value: int | float | None) -> str:
     return f"+Rp{amount:,}" if amount > 0 else (f"-Rp{abs(amount):,}" if amount < 0 else "Rp0")
 
 
+def _snapshot_age(snapshot: dict) -> str:
+    raw = snapshot.get("snapshot_at")
+    if not raw:
+        return "?"
+    try:
+        stamp = datetime.fromisoformat(raw)
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        seconds = max(0, int((datetime.now(timezone.utc) - stamp).total_seconds()))
+    except ValueError:
+        return "?"
+
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h"
+
+
 class TelegramCommands:
     """Handles incoming Telegram commands alongside the existing notifier."""
 
@@ -96,6 +115,14 @@ class TelegramCommands:
         bot_name = raw.strip()
         return bot_name if bot_name in FLEET_BOT_NAMES else None
 
+    def _parse_scope_arg(self, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+        if not context.args:
+            return None
+        raw = context.args[0].strip().lower()
+        if raw == "all":
+            return "all"
+        return self._normalize_bot_name(raw)
+
     # ─── /start & /help ──────────────────────────────────────────────────────
 
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -104,19 +131,20 @@ class TelegramCommands:
         text = (
             f"<b>{INSTANCE_LABEL} — Command List</b>\n\n"
             "/status   — Ringkasan status operasional\n"
+            "/status X — Status bot tertentu / all\n"
             "/balance  — Cek saldo akun\n"
             "/history  — 10 bet terakhir + net\n"
             "/results  — 10 hasil draw terakhir\n"
             "/stats    — Statistik settle hari ini\n"
             "/profit   — Ringkasan profit bot\n"
             "/level    — Level martingale BK & GJ\n"
-            "/signal   — Snapshot prediksi terakhir\n"
+            "/signal X — Snapshot prediksi bot tertentu\n"
             "/predict  — Analisis manual tanpa pasang bet\n"
             "/bots     — Status fleet bot\n"
             "/bot_on X — Aktifkan bot tertentu\n"
             "/bot_off X — Matikan bot tertentu\n"
-            "/pause    — Pause bot (skip siklus)\n"
-            "/resume   — Resume bot\n"
+            "/pause X  — Pause bot tertentu / all\n"
+            "/resume X — Resume bot tertentu / all\n"
             "/help     — Tampilkan menu ini"
         )
         await update.message.reply_text(text, parse_mode="HTML")
@@ -125,6 +153,31 @@ class TelegramCommands:
 
     async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update):
+            return
+
+        scope = self._parse_scope_arg(context)
+        if scope == "all":
+            await self._cmd_bots(update, context)
+            return
+        if scope and scope != fleet.INSTANCE_NAME:
+            snapshot = fleet.get_snapshots().get(scope, {})
+            if not snapshot:
+                await update.message.reply_text(f"Belum ada snapshot untuk {scope}.")
+                return
+            text = (
+                f"<b>Status {snapshot.get('instance_label', scope)}</b>\n\n"
+                f"Bot       : {scope}\n"
+                f"Enabled   : {'YA' if snapshot.get('enabled', True) else 'TIDAK'}\n"
+                f"Paused    : {'YA' if snapshot.get('paused', False) else 'TIDAK'}\n"
+                f"Target    : 2D {snapshot.get('target', '?')}\n"
+                f"Mode      : {snapshot.get('mode', '?')}\n"
+                f"Saldo     : {_idr(snapshot.get('balance'))}\n"
+                f"Daily loss: {_idr(snapshot.get('daily_loss'))}\n"
+                f"BK        : Lv {snapshot.get('bk_level', '?')} | {_idr(snapshot.get('bk_bet'))}/angka\n"
+                f"GJ        : Lv {snapshot.get('gj_level', '?')} | {_idr(snapshot.get('gj_bet'))}/angka\n"
+                f"Heartbeat : {_snapshot_age(snapshot)} lalu"
+            )
+            await update.message.reply_text(text, parse_mode="HTML")
             return
 
         summary = await self._mm.get_status_summary()
@@ -319,16 +372,22 @@ class TelegramCommands:
         if not self._is_authorized(update):
             return
 
-        raw = await db.get_state("last_signal_snapshot")
-        if not raw:
-            await update.message.reply_text("Belum ada snapshot prediksi.")
-            return
-
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            await update.message.reply_text("Snapshot prediksi rusak atau tidak bisa dibaca.")
-            return
+        scope = self._parse_scope_arg(context)
+        if scope and scope != fleet.INSTANCE_NAME:
+            data = (fleet.get_snapshots().get(scope, {}) or {}).get("last_signal_snapshot")
+            if not data:
+                await update.message.reply_text(f"Belum ada snapshot prediksi untuk {scope}.")
+                return
+        else:
+            raw = await db.get_state("last_signal_snapshot")
+            if not raw:
+                await update.message.reply_text("Belum ada snapshot prediksi.")
+                return
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                await update.message.reply_text("Snapshot prediksi rusak atau tidak bisa dibaca.")
+                return
 
         bk = data.get("besar_kecil", {})
         gj = data.get("genap_ganjil", {})
@@ -432,14 +491,46 @@ class TelegramCommands:
     async def _cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update):
             return
+
+        scope = self._parse_scope_arg(context)
+        if scope == "all":
+            for bot_name in FLEET_BOT_NAMES:
+                fleet.set_bot_paused(bot_name, True)
+            self._paused = True
+            await db.set_state("bot_paused", "1")
+            await update.message.reply_text("Semua bot di-PAUSE.")
+            return
+
+        if scope and scope != fleet.INSTANCE_NAME:
+            fleet.set_bot_paused(scope, True)
+            await update.message.reply_text(f"{scope} di-PAUSE.")
+            return
+
         self._paused = True
+        fleet.set_bot_paused(fleet.INSTANCE_NAME, True)
         await db.set_state("bot_paused", "1")
         await update.message.reply_text("Bot di-PAUSE. Siklus berikutnya akan di-skip.\nKetik /resume untuk lanjutkan.")
 
     async def _cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update):
             return
+
+        scope = self._parse_scope_arg(context)
+        if scope == "all":
+            for bot_name in FLEET_BOT_NAMES:
+                fleet.set_bot_paused(bot_name, False)
+            self._paused = False
+            await db.set_state("bot_paused", "0")
+            await update.message.reply_text("Semua bot di-RESUME.")
+            return
+
+        if scope and scope != fleet.INSTANCE_NAME:
+            fleet.set_bot_paused(scope, False)
+            await update.message.reply_text(f"{scope} di-RESUME.")
+            return
+
         self._paused = False
+        fleet.set_bot_paused(fleet.INSTANCE_NAME, False)
         await db.set_state("bot_paused", "0")
         await update.message.reply_text("Bot RESUMED. Siklus berikutnya akan berjalan normal.")
 
@@ -452,8 +543,9 @@ class TelegramCommands:
             snapshot = bots.get(bot_name, {})
             lines.append(
                 f"{bot_name} | {'ON' if snapshot.get('enabled', True) else 'OFF'} | "
+                f"{'PAUSED' if snapshot.get('paused', False) else 'RUN'} | "
                 f"target={snapshot.get('target', '?')} | balance={_idr(snapshot.get('balance'))} | "
-                f"daily_loss={_idr(snapshot.get('daily_loss', 0))}"
+                f"daily_loss={_idr(snapshot.get('daily_loss', 0))} | age={_snapshot_age(snapshot)}"
             )
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -550,7 +642,7 @@ class TelegramCommands:
 
         # Restore pause state
         paused = await db.get_state("bot_paused", "0")
-        self._paused = paused == "1"
+        self._paused = paused == "1" or fleet.is_bot_paused(fleet.INSTANCE_NAME)
 
         await self._app.initialize()
         await self._app.start()

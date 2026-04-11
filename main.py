@@ -138,6 +138,7 @@ class HokidrawBot:
             "note": note or "",
         }
         await db.set_state("last_signal_snapshot", json.dumps(payload, ensure_ascii=True))
+        fleet.update_snapshot({"last_signal_snapshot": payload})
 
     async def _publish_snapshot(self, balance: Optional[int] = None) -> None:
         summary = await self.mm.get_status_summary()
@@ -145,6 +146,7 @@ class HokidrawBot:
             "instance_label": INSTANCE_LABEL,
             "target": BET_TARGET,
             "enabled": fleet.is_bot_enabled(INSTANCE_NAME),
+            "paused": fleet.is_bot_paused(INSTANCE_NAME) or self.tg_commands.is_paused,
             "balance": balance if balance is not None else await self.auth.get_balance(),
             "daily_loss": summary["daily_loss"],
             "bk_level": summary["bk_level"],
@@ -165,7 +167,7 @@ class HokidrawBot:
             return
 
         # 0. Cek pause
-        if self.tg_commands.is_paused:
+        if self.tg_commands.is_paused or fleet.is_bot_paused(INSTANCE_NAME):
             logger.info("Bot di-PAUSE via Telegram — skip siklus ini")
             await self.notifier.notify_alert("Siklus di-skip karena bot sedang PAUSE")
             return

@@ -52,6 +52,7 @@ def get_fleet_state() -> dict[str, Any]:
     for name in FLEET_BOT_NAMES:
         bot = bots.setdefault(name, {})
         bot.setdefault("enabled", True)
+        bot.setdefault("paused", False)
     return state
 
 
@@ -67,6 +68,20 @@ def set_bot_enabled(bot_name: str, enabled: bool) -> dict[str, Any]:
 def is_bot_enabled(bot_name: str = INSTANCE_NAME) -> bool:
     state = get_fleet_state()
     return bool(state["bots"].get(bot_name, {}).get("enabled", True))
+
+
+def set_bot_paused(bot_name: str, paused: bool) -> dict[str, Any]:
+    state = get_fleet_state()
+    bot = state["bots"].setdefault(bot_name, {})
+    bot["paused"] = paused
+    bot["updated_at"] = datetime.now(_UTC).isoformat()
+    _atomic_write_json(fleet_state_path(), state)
+    return state
+
+
+def is_bot_paused(bot_name: str = INSTANCE_NAME) -> bool:
+    state = get_fleet_state()
+    return bool(state["bots"].get(bot_name, {}).get("paused", False))
 
 
 def update_snapshot(snapshot: dict[str, Any], bot_name: str = INSTANCE_NAME) -> dict[str, Any]:
@@ -94,4 +109,3 @@ def write_plan(plan: dict[str, Any]) -> None:
 
 def read_plan() -> dict[str, Any]:
     return _read_json(fleet_plan_path(), {})
-
