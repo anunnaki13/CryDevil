@@ -123,6 +123,24 @@ class TelegramCommands:
             return "all"
         return self._normalize_bot_name(raw)
 
+    def _fleet_snapshot_lines(self, snapshots: dict, *, include_levels: bool = False) -> list[str]:
+        lines: list[str] = []
+        for bot_name in FLEET_BOT_NAMES:
+            snapshot = snapshots.get(bot_name, {}) or {}
+            parts = [
+                f"<b>{snapshot.get('instance_label', bot_name)}</b> ({bot_name})",
+                f"target=2D {snapshot.get('target', '?')}",
+                f"saldo={_idr(snapshot.get('balance'))}",
+                f"{'ON' if snapshot.get('enabled', True) else 'OFF'}",
+                "PAUSED" if snapshot.get('paused', False) else "RUN",
+                f"age={_snapshot_age(snapshot)}",
+            ]
+            if include_levels:
+                parts.append(f"BK Lv{snapshot.get('bk_level', '?')} {_idr(snapshot.get('bk_bet'))}")
+                parts.append(f"GJ Lv{snapshot.get('gj_level', '?')} {_idr(snapshot.get('gj_bet'))}")
+            lines.append(" | ".join(parts))
+        return lines
+
     # ─── /start & /help ──────────────────────────────────────────────────────
 
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -132,7 +150,8 @@ class TelegramCommands:
             f"<b>{INSTANCE_LABEL} — Command List</b>\n\n"
             "/status   — Ringkasan status operasional\n"
             "/status X — Status bot tertentu / all\n"
-            "/balance  — Cek saldo akun\n"
+            "/balance  — Cek saldo fleet\n"
+            "/balance X — Cek saldo bot tertentu / all\n"
             "/history  — 10 bet terakhir + net\n"
             "/results  — 10 hasil draw terakhir\n"
             "/stats    — Statistik settle hari ini\n"
@@ -213,9 +232,35 @@ class TelegramCommands:
         if not self._is_authorized(update):
             return
 
+        scope = self._parse_scope_arg(context)
+        snapshots = fleet.get_snapshots()
+
+        if scope == "all" or (scope is None and len(FLEET_BOT_NAMES) > 1):
+            lines = ["<b>Saldo Fleet</b>\n"]
+            lines.extend(self._fleet_snapshot_lines(snapshots))
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+            return
+
+        if scope and scope != fleet.INSTANCE_NAME:
+            snapshot = snapshots.get(scope, {})
+            if not snapshot:
+                await update.message.reply_text(f"Belum ada snapshot untuk {scope}.")
+                return
+            text = (
+                f"<b>Saldo {snapshot.get('instance_label', scope)}</b>\n\n"
+                f"Bot    : {scope}\n"
+                f"Target : 2D {snapshot.get('target', '?')}\n"
+                f"Saldo  : {_idr(snapshot.get('balance'))}\n"
+                f"Status : {'ON' if snapshot.get('enabled', True) else 'OFF'} | "
+                f"{'PAUSED' if snapshot.get('paused', False) else 'RUN'}\n"
+                f"Update : {_snapshot_age(snapshot)} lalu"
+            )
+            await update.message.reply_text(text, parse_mode="HTML")
+            return
+
         balance = await self._auth.get_balance()
         if balance is not None:
-            text = f"Saldo saat ini: <b>{_idr(balance)}</b>"
+            text = f"Saldo {INSTANCE_LABEL} saat ini: <b>{_idr(balance)}</b>"
         else:
             text = "Gagal mengambil saldo. Mungkin sesi expired."
         await update.message.reply_text(text, parse_mode="HTML")
@@ -539,14 +584,7 @@ class TelegramCommands:
             return
         bots = fleet.get_snapshots()
         lines = ["<b>Status Fleet Bot</b>\n"]
-        for bot_name in FLEET_BOT_NAMES:
-            snapshot = bots.get(bot_name, {})
-            lines.append(
-                f"{bot_name} | {'ON' if snapshot.get('enabled', True) else 'OFF'} | "
-                f"{'PAUSED' if snapshot.get('paused', False) else 'RUN'} | "
-                f"target={snapshot.get('target', '?')} | balance={_idr(snapshot.get('balance'))} | "
-                f"daily_loss={_idr(snapshot.get('daily_loss', 0))} | age={_snapshot_age(snapshot)}"
-            )
+        lines.extend(self._fleet_snapshot_lines(bots, include_levels=True))
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def _cmd_bot_on(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -624,7 +662,7 @@ class TelegramCommands:
         # Set bot command menu in Telegram
         await self._app.bot.set_my_commands([
             BotCommand("status", "Ringkasan status bot"),
-            BotCommand("balance", "Cek saldo akun"),
+            BotCommand("balance", "Cek saldo 3 bot"),
             BotCommand("history", "10 bet terakhir + net"),
             BotCommand("results", "10 hasil draw terakhir"),
             BotCommand("stats", "Statistik settle hari ini"),

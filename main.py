@@ -36,6 +36,7 @@ from config import (
     LOG_PATH, BET_MODE, BET_TARGET, INSTANCE_LABEL,
     MIN_CONFIDENCE_TO_BET,
     FLEET_SHARED_ANALYSIS, FLEET_ROLE, INSTANCE_NAME,
+    FLEET_SNAPSHOT_REFRESH_SECONDS,
     validate_config,
 )
 from modules import database as db
@@ -588,6 +589,18 @@ class HokidrawBot:
 
         await self.mm.midnight_reset()
 
+    async def refresh_snapshot(self) -> None:
+        """Refresh shared fleet snapshot outside the hourly betting cycle."""
+        try:
+            if not await self.auth.ensure_logged_in():
+                logger.warning("Refresh snapshot skip: login/session tidak valid")
+                return
+            balance = await self.auth.get_balance()
+            await self._publish_snapshot(balance=balance)
+            logger.info("Fleet snapshot diperbarui. Balance: Rp%s", f"{balance:,}" if balance is not None else "?")
+        except Exception:
+            logger.exception("Gagal refresh fleet snapshot")
+
     # ─── Startup / Shutdown ───────────────────────────────────────────────────
 
     async def startup(self) -> None:
@@ -638,6 +651,16 @@ async def run(dry_run: bool) -> None:
         CronTrigger(hour=23, minute=55, timezone="Asia/Jakarta"),
         id="daily_summary",
         max_instances=1,
+    )
+
+    scheduler.add_job(
+        bot.refresh_snapshot,
+        "interval",
+        seconds=FLEET_SNAPSHOT_REFRESH_SECONDS,
+        id="refresh_snapshot",
+        max_instances=1,
+        coalesce=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=30),
     )
 
     scheduler.start()
