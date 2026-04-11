@@ -10,11 +10,13 @@ Commands:
   /stats         — statistik hari ini
   /profit        — profit hari ini & total
   /level         — level martingale BK & GJ saat ini
+  /signal        — snapshot prediksi terakhir
   /predict       — trigger prediksi LLM (tanpa bet)
   /pause         — pause bot (skip siklus)
   /resume        — resume bot
 """
 
+import json
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -95,6 +97,7 @@ class TelegramCommands:
             "/stats    — Statistik settle hari ini\n"
             "/profit   — Ringkasan profit bot\n"
             "/level    — Level martingale BK & GJ\n"
+            "/signal   — Snapshot prediksi terakhir\n"
             "/bots     — Status fleet bot\n"
             "/bot_on X — Aktifkan bot tertentu\n"
             "/bot_off X — Matikan bot tertentu\n"
@@ -298,6 +301,44 @@ class TelegramCommands:
         )
         await update.message.reply_text(text, parse_mode="HTML")
 
+    async def _cmd_signal(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update):
+            return
+
+        raw = await db.get_state("last_signal_snapshot")
+        if not raw:
+            await update.message.reply_text("Belum ada snapshot prediksi.")
+            return
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            await update.message.reply_text("Snapshot prediksi rusak atau tidak bisa dibaca.")
+            return
+
+        bk = data.get("besar_kecil", {})
+        gj = data.get("genap_ganjil", {})
+        selected_dim = data.get("selected_dimension") or "-"
+        selected_choice = data.get("selected_choice") or "-"
+        selected_conf = data.get("selected_confidence")
+        selected_conf_str = f"{float(selected_conf):.0%}" if selected_conf is not None else "-"
+
+        text = (
+            f"<b>Signal Snapshot</b>\n\n"
+            f"Periode   : {data.get('period', '-')}\n"
+            f"Target    : 2D {data.get('target', BET_TARGET)}\n"
+            f"Source    : {data.get('source', '-')}\n"
+            f"Decision  : {data.get('decision', '-')}\n"
+            f"Threshold : {float(data.get('threshold', 0.6)):.0%}\n"
+            f"Selected  : {selected_dim} | {selected_choice} | {selected_conf_str}\n\n"
+            f"BK        : {bk.get('choice', '-')} | {float(bk.get('confidence', 0.5)):.0%}\n"
+            f"Reason BK : {bk.get('reason', '-')}\n\n"
+            f"GJ        : {gj.get('choice', '-')} | {float(gj.get('confidence', 0.5)):.0%}\n"
+            f"Reason GJ : {gj.get('reason', '-')}\n\n"
+            f"Note      : {data.get('note', '-')}"
+        )
+        await update.message.reply_text(text, parse_mode="HTML")
+
     # ─── /pause & /resume ────────────────────────────────────────────────────
 
     async def _cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -392,6 +433,7 @@ class TelegramCommands:
         self._app.add_handler(CommandHandler("stats", self._cmd_stats))
         self._app.add_handler(CommandHandler("profit", self._cmd_profit))
         self._app.add_handler(CommandHandler("level", self._cmd_level))
+        self._app.add_handler(CommandHandler("signal", self._cmd_signal))
         self._app.add_handler(CommandHandler("bots", self._cmd_bots))
         self._app.add_handler(CommandHandler("bot_on", self._cmd_bot_on))
         self._app.add_handler(CommandHandler("bot_off", self._cmd_bot_off))
@@ -407,6 +449,7 @@ class TelegramCommands:
             BotCommand("stats", "Statistik settle hari ini"),
             BotCommand("profit", "Ringkasan profit bot"),
             BotCommand("level", "Level martingale BK & GJ"),
+            BotCommand("signal", "Snapshot prediksi terakhir"),
             BotCommand("bots", "Status fleet bot"),
             BotCommand("bot_on", "Aktifkan bot tertentu"),
             BotCommand("bot_off", "Matikan bot tertentu"),

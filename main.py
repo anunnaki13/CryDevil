@@ -20,6 +20,7 @@ Usage:
 
 import asyncio
 import argparse
+import json
 import logging
 import sys
 import os
@@ -96,6 +97,41 @@ class HokidrawBot:
         if bk_data["confidence"] >= gj_data["confidence"]:
             return "besar_kecil", bk_data
         return "genap_ganjil", gj_data
+
+    async def _store_signal_snapshot(
+        self,
+        periode: str,
+        bk_data: dict,
+        gj_data: dict,
+        source: str,
+        decision: str,
+        selected_dimension: str | None = None,
+        selected_choice: str | None = None,
+        selected_confidence: float | None = None,
+        note: str | None = None,
+    ) -> None:
+        payload = {
+            "period": periode,
+            "target": BET_TARGET,
+            "source": source,
+            "decision": decision,
+            "selected_dimension": selected_dimension,
+            "selected_choice": selected_choice,
+            "selected_confidence": selected_confidence,
+            "threshold": MIN_CONFIDENCE_TO_BET,
+            "besar_kecil": {
+                "choice": bk_data.get("choice"),
+                "confidence": bk_data.get("confidence"),
+                "reason": bk_data.get("reason", ""),
+            },
+            "genap_ganjil": {
+                "choice": gj_data.get("choice"),
+                "confidence": gj_data.get("confidence"),
+                "reason": gj_data.get("reason", ""),
+            },
+            "note": note or "",
+        }
+        await db.set_state("last_signal_snapshot", json.dumps(payload, ensure_ascii=True))
 
     async def _publish_snapshot(self, balance: Optional[int] = None) -> None:
         summary = await self.mm.get_status_summary()
@@ -215,6 +251,14 @@ class HokidrawBot:
                 return
             if my_plan.get("action") != "BET":
                 logger.info("Plan fleet memutuskan SKIP untuk %s: %s", INSTANCE_NAME, my_plan.get("note", ""))
+                await self._store_signal_snapshot(
+                    periode,
+                    my_plan["besar_kecil"],
+                    my_plan["genap_ganjil"],
+                    source="fleet",
+                    decision="SKIP",
+                    note=my_plan.get("note", ""),
+                )
                 return
 
             bk_data = my_plan["besar_kecil"]
@@ -242,6 +286,13 @@ class HokidrawBot:
                 BET_TARGET,
                 bk_data["choice"], bk_data["confidence"] * 100,
                 gj_data["choice"], gj_data["confidence"] * 100,
+            )
+            await self._store_signal_snapshot(
+                periode,
+                bk_data,
+                gj_data,
+                source="single",
+                decision="ANALYZED",
             )
 
         # 8. Ambil bet amount dari money manager (per dimensi)
@@ -277,7 +328,29 @@ class HokidrawBot:
                     "Skip bet: confidence tertinggi "
                     f"{chosen_conf:.0%} masih di bawah threshold {MIN_CONFIDENCE_TO_BET:.0%}"
                 )
+                await self._store_signal_snapshot(
+                    periode,
+                    bk_data,
+                    gj_data,
+                    source="fleet" if FLEET_SHARED_ANALYSIS else "single",
+                    decision="SKIP",
+                    selected_dimension=chosen_dimension,
+                    selected_choice=chosen_data["choice"],
+                    selected_confidence=chosen_conf,
+                    note="below_threshold",
+                )
                 return
+
+            await self._store_signal_snapshot(
+                periode,
+                bk_data,
+                gj_data,
+                source="fleet" if FLEET_SHARED_ANALYSIS else "single",
+                decision="BET",
+                selected_dimension=chosen_dimension,
+                selected_choice=chosen_data["choice"],
+                selected_confidence=chosen_conf,
+            )
 
             if chosen_dimension == "besar_kecil":
                 bk_resp = await self.bettor.place_bet(bk_data["choice"], bk_amount, self.dry_run)
