@@ -265,3 +265,34 @@ async def get_daily_stats(date: str) -> dict | None:
         ) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
+
+
+async def get_aggregate_daily_stats() -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT
+                   COUNT(*) AS total_days,
+                   COALESCE(SUM(total_bets), 0) AS total_bets,
+                   COALESCE(SUM(total_wins), 0) AS total_wins,
+                   COALESCE(SUM(total_bet_amount), 0) AS total_bet_amount,
+                   COALESCE(SUM(total_win_amount), 0) AS total_win_amount,
+                   COALESCE(SUM(profit), 0) AS profit
+               FROM daily_stats"""
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else {
+                "total_days": 0,
+                "total_bets": 0,
+                "total_wins": 0,
+                "total_bet_amount": 0,
+                "total_win_amount": 0,
+                "profit": 0,
+            }
+
+
+async def count_distinct_bet_periods() -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(DISTINCT period) FROM bets") as cur:
+            row = await cur.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0

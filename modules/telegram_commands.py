@@ -47,6 +47,19 @@ def _today_wib() -> str:
     return _now_wib().strftime("%Y-%m-%d")
 
 
+def _idr(value: int | float | None) -> str:
+    if value is None:
+        return "?"
+    return f"Rp{int(value):,}"
+
+
+def _net(value: int | float | None) -> str:
+    if value is None:
+        return "?"
+    amount = int(value)
+    return f"+Rp{amount:,}" if amount > 0 else (f"-Rp{abs(amount):,}" if amount < 0 else "Rp0")
+
+
 class TelegramCommands:
     """Handles incoming Telegram commands alongside the existing notifier."""
 
@@ -75,12 +88,12 @@ class TelegramCommands:
             return
         text = (
             f"<b>{INSTANCE_LABEL} — Command List</b>\n\n"
-            "/status   — Status bot & konfigurasi\n"
+            "/status   — Ringkasan status operasional\n"
             "/balance  — Cek saldo akun\n"
-            "/history  — 10 bet terakhir\n"
+            "/history  — 10 bet terakhir + net\n"
             "/results  — 10 hasil draw terakhir\n"
-            "/stats    — Statistik hari ini\n"
-            "/profit   — Profit hari ini & keseluruhan\n"
+            "/stats    — Statistik settle hari ini\n"
+            "/profit   — Ringkasan profit bot\n"
             "/level    — Level martingale BK & GJ\n"
             "/bots     — Status fleet bot\n"
             "/bot_on X — Aktifkan bot tertentu\n"
@@ -107,20 +120,20 @@ class TelegramCommands:
 
         text = (
             f"<b>Status Bot {INSTANCE_LABEL} — {now}</b>\n\n"
-            f"Mode      : {pause_str}\n"
-            f"Balance   : {bal_str}\n"
+            f"Status    : {pause_str}\n"
+            f"Saldo     : {bal_str}\n"
             f"Target    : 2D {BET_TARGET}\n"
-            f"Bet Mode  : {BET_MODE}\n"
-            f"Base Bet  : Rp{BASE_BET:,}/angka\n"
+            f"Mode Bet  : {BET_MODE}\n"
+            f"Base Bet  : {_idr(BASE_BET)}/angka\n"
             f"LLM       : {LLM_PRIMARY}\n"
-            f"Last Bet  : Periode {last_period}\n\n"
+            f"Periode terakhir: {last_period}\n\n"
             f"<b>Martingale</b>\n"
-            f"BK Level  : {summary['bk_level']} (Rp{summary['bk_bet']:,}/angka) | Streak kalah: {summary['bk_losses']}\n"
-            f"GJ Level  : {summary['gj_level']} (Rp{summary['gj_bet']:,}/angka) | Streak kalah: {summary['gj_losses']}\n\n"
-            f"<b>Daily Limit</b>\n"
-            f"Rugi hari ini : Rp{summary['daily_loss']:,} / Rp{DAILY_LOSS_LIMIT:,}\n"
-            f"Sisa limit    : Rp{summary['limit_sisa']:,}\n"
-            f"Limit tercapai: {'YA' if summary['limit_hit'] else 'Belum'}"
+            f"BK        : Lv {summary['bk_level']} | bet {_idr(summary['bk_bet'])}/angka | streak kalah {summary['bk_losses']}\n"
+            f"GJ        : Lv {summary['gj_level']} | bet {_idr(summary['gj_bet'])}/angka | streak kalah {summary['gj_losses']}\n\n"
+            f"<b>Limit Harian</b>\n"
+            f"Rugi hari ini : {_idr(summary['daily_loss'])} / {_idr(DAILY_LOSS_LIMIT)}\n"
+            f"Sisa limit    : {_idr(summary['limit_sisa'])}\n"
+            f"Limit hit     : {'YA' if summary['limit_hit'] else 'BELUM'}"
         )
         await update.message.reply_text(text, parse_mode="HTML")
 
@@ -132,7 +145,7 @@ class TelegramCommands:
 
         balance = await self._auth.get_balance()
         if balance is not None:
-            text = f"Saldo saat ini: <b>Rp{balance:,}</b>"
+            text = f"Saldo saat ini: <b>{_idr(balance)}</b>"
         else:
             text = "Gagal mengambil saldo. Mungkin sesi expired."
         await update.message.reply_text(text, parse_mode="HTML")
@@ -153,19 +166,22 @@ class TelegramCommands:
 
         for b in bets:
             status = b["status"]
-            icon = {"won": "+", "lost": "-", "placed": "~"}.get(status, "?")
+            icon = {"won": "WIN", "lost": "LOSS", "placed": "OPEN"}.get(status, "?")
             dim_short = "BK" if b["bet_dimension"] == "besar_kecil" else "GJ"
             choice = choice_labels.get(b["bet_choice"], b["bet_choice"])
             amount = int(b["bet_amount_per_angka"])
+            stake = amount * 50
             net = ""
             if status == "won":
-                net = f" +Rp{int(b['win_amount']):,}"
+                net = _net(int(b["win_amount"]) - stake)
             elif status == "lost":
-                net = f" -Rp{amount * 50:,}"
+                net = _net(-stake)
+            else:
+                net = f"modal {_idr(stake)}"
 
             lines.append(
-                f"[{icon}] P{b['period']} | {dim_short} {choice} | "
-                f"Rp{amount:,}/angka | Lv{b['martingale_level']}{net}"
+                f"{icon} | P{b['period']} | {dim_short} {choice} | "
+                f"Lv{b['martingale_level']} | conf {float(b['confidence']):.0%} | {net}"
             )
 
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
@@ -181,15 +197,12 @@ class TelegramCommands:
             await update.message.reply_text("Belum ada data hasil draw di database.")
             return
 
-        bk_labels = {"BE": "BE", "KE": "KE"}
-        gj_labels = {"GE": "GE", "GA": "GA"}
-
         lines = ["<b>10 Hasil Draw Terakhir</b>\n"]
         for r in results:
             lines.append(
                 f"P{r['period']} | {r['full_number']} | "
-                f"2D {r['target_position']}={r['target_number_2d']} "
-                f"({r['target_bk']}/{r['target_gj']})"
+                f"2D {r['target_position']}={r['target_number_2d']} | "
+                f"BK {r['target_bk']} | GJ {r['target_gj']}"
             )
 
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
@@ -212,17 +225,16 @@ class TelegramCommands:
         losses = total - wins
         wr = (wins / total * 100) if total else 0
         profit = int(stats["profit"])
-        profit_str = f"+Rp{profit:,}" if profit >= 0 else f"-Rp{abs(profit):,}"
 
         text = (
             f"<b>Statistik Hari Ini — {today}</b>\n\n"
-            f"Total Bet   : {total}\n"
+            f"Bet settle  : {total}\n"
             f"Menang      : {wins}\n"
             f"Kalah       : {losses}\n"
-            f"Win Rate    : {wr:.1f}%\n"
-            f"Total Taruh : Rp{int(stats['total_bet_amount']):,}\n"
-            f"Total Menang: Rp{int(stats['total_win_amount']):,}\n"
-            f"Profit      : {profit_str}"
+            f"Win rate    : {wr:.1f}%\n"
+            f"Modal       : {_idr(stats['total_bet_amount'])}\n"
+            f"Payout      : {_idr(stats['total_win_amount'])}\n"
+            f"Net         : <b>{_net(profit)}</b>"
         )
         await update.message.reply_text(text, parse_mode="HTML")
 
@@ -235,25 +247,26 @@ class TelegramCommands:
         today = _today_wib()
         today_stats = await db.get_daily_stats(today)
 
-        # Profit hari ini
         today_profit = int(today_stats["profit"]) if today_stats else 0
-        today_str = f"+Rp{today_profit:,}" if today_profit >= 0 else f"-Rp{abs(today_profit):,}"
-
-        # Profit keseluruhan (semua hari)
-        all_stats = await self._get_all_daily_stats()
-        total_profit = sum(int(s["profit"]) for s in all_stats)
-        total_str = f"+Rp{total_profit:,}" if total_profit >= 0 else f"-Rp{abs(total_profit):,}"
-        total_days = len(all_stats)
-
-        # Balance
+        aggregate = await db.get_aggregate_daily_stats()
+        total_days = int(aggregate["total_days"])
+        total_periods = await db.count_distinct_bet_periods()
         balance = await self._auth.get_balance()
-        bal_str = f"Rp{balance:,}" if balance else "?"
+        bal_str = _idr(balance) if balance is not None else "?"
 
         text = (
             f"<b>Profit Report</b>\n\n"
-            f"Hari ini ({today}): <b>{today_str}</b>\n"
-            f"Total ({total_days} hari)   : <b>{total_str}</b>\n"
-            f"Balance saat ini : {bal_str}"
+            f"Hari ini ({today})\n"
+            f"Modal : {_idr(today_stats['total_bet_amount']) if today_stats else _idr(0)}\n"
+            f"Payout: {_idr(today_stats['total_win_amount']) if today_stats else _idr(0)}\n"
+            f"Net   : <b>{_net(today_profit)}</b>\n\n"
+            f"Akumulasi\n"
+            f"Hari tercatat : {total_days}\n"
+            f"Periode bet   : {total_periods}\n"
+            f"Modal total   : {_idr(aggregate['total_bet_amount'])}\n"
+            f"Payout total  : {_idr(aggregate['total_win_amount'])}\n"
+            f"Net total     : <b>{_net(aggregate['profit'])}</b>\n"
+            f"Saldo saat ini: {bal_str}"
         )
         await update.message.reply_text(text, parse_mode="HTML")
 
@@ -273,15 +286,15 @@ class TelegramCommands:
             f"<b>Martingale Level</b>\n\n"
             f"Daftar level: {levels_str}\n\n"
             f"<b>Besar/Kecil</b>\n"
-            f"  Level     : {bk_lv} / {len(MARTINGALE_LEVELS)-1}\n"
-            f"  Bet/angka : Rp{summary['bk_bet']:,}\n"
-            f"  Total/bet : Rp{summary['bk_bet']*50:,}\n"
-            f"  Kalah berturut: {summary['bk_losses']}\n\n"
+            f"Level     : {bk_lv} / {len(MARTINGALE_LEVELS)-1}\n"
+            f"Bet/angka : {_idr(summary['bk_bet'])}\n"
+            f"Modal/bet : {_idr(summary['bk_bet']*50)}\n"
+            f"Kalah berturut: {summary['bk_losses']}\n\n"
             f"<b>Genap/Ganjil</b>\n"
-            f"  Level     : {gj_lv} / {len(MARTINGALE_LEVELS)-1}\n"
-            f"  Bet/angka : Rp{summary['gj_bet']:,}\n"
-            f"  Total/bet : Rp{summary['gj_bet']*50:,}\n"
-            f"  Kalah berturut: {summary['gj_losses']}"
+            f"Level     : {gj_lv} / {len(MARTINGALE_LEVELS)-1}\n"
+            f"Bet/angka : {_idr(summary['gj_bet'])}\n"
+            f"Modal/bet : {_idr(summary['gj_bet']*50)}\n"
+            f"Kalah berturut: {summary['gj_losses']}"
         )
         await update.message.reply_text(text, parse_mode="HTML")
 
@@ -310,8 +323,8 @@ class TelegramCommands:
             snapshot = bots.get(bot_name, {})
             lines.append(
                 f"{bot_name} | {'ON' if snapshot.get('enabled', True) else 'OFF'} | "
-                f"target={snapshot.get('target', '?')} | balance={snapshot.get('balance', '?')} | "
-                f"daily_loss={snapshot.get('daily_loss', 0)}"
+                f"target={snapshot.get('target', '?')} | balance={_idr(snapshot.get('balance'))} | "
+                f"daily_loss={_idr(snapshot.get('daily_loss', 0))}"
             )
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -355,14 +368,6 @@ class TelegramCommands:
             ) as cur:
                 return [dict(r) for r in await cur.fetchall()]
 
-    async def _get_all_daily_stats(self) -> list[dict]:
-        async with __import__("aiosqlite").connect(DB_PATH) as conn:
-            conn.row_factory = __import__("aiosqlite").Row
-            async with conn.execute(
-                "SELECT * FROM daily_stats ORDER BY date DESC"
-            ) as cur:
-                return [dict(r) for r in await cur.fetchall()]
-
     # ─── Setup & start ───────────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -395,12 +400,12 @@ class TelegramCommands:
 
         # Set bot command menu in Telegram
         await self._app.bot.set_my_commands([
-            BotCommand("status", "Status bot & konfigurasi"),
+            BotCommand("status", "Ringkasan status bot"),
             BotCommand("balance", "Cek saldo akun"),
-            BotCommand("history", "10 bet terakhir"),
+            BotCommand("history", "10 bet terakhir + net"),
             BotCommand("results", "10 hasil draw terakhir"),
-            BotCommand("stats", "Statistik hari ini"),
-            BotCommand("profit", "Profit hari ini & total"),
+            BotCommand("stats", "Statistik settle hari ini"),
+            BotCommand("profit", "Ringkasan profit bot"),
             BotCommand("level", "Level martingale BK & GJ"),
             BotCommand("bots", "Status fleet bot"),
             BotCommand("bot_on", "Aktifkan bot tertentu"),

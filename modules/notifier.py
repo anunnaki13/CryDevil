@@ -50,6 +50,16 @@ class TelegramNotifier:
     def _title(self, text: str) -> str:
         return f"[{INSTANCE_LABEL}] {text}"
 
+    @staticmethod
+    def _idr(amount: int | float) -> str:
+        value = int(amount)
+        return f"Rp{value:,}"
+
+    @staticmethod
+    def _net(amount: int | float) -> str:
+        value = int(amount)
+        return f"+Rp{value:,}" if value > 0 else (f"-Rp{abs(value):,}" if value < 0 else "Rp0")
+
     # ─── Bet placed ──────────────────────────────────────────────────────────
 
     async def notify_bet_placed(
@@ -77,18 +87,20 @@ class TelegramNotifier:
         if bk_choice is not None and bk_confidence is not None and bk_level is not None:
             total += bk_amount * 50
             lines.append(
-                f"Besar/Kecil : <b>{bk_labels[bk_choice]}</b> (confidence: {bk_confidence:.0%}) — "
-                f"Level {bk_level} — Rp{bk_amount:,}/angka × 50 = Rp{bk_amount*50:,}"
+                f"BK : <b>{bk_labels[bk_choice]}</b> | conf {bk_confidence:.0%} | "
+                f"Lv {bk_level} | modal {self._idr(bk_amount*50)} | "
+                f"net jika menang {self._net((bk_amount * 100) - (bk_amount * 50))}"
             )
 
         if gj_choice is not None and gj_confidence is not None and gj_level is not None:
             total += gj_amount * 50
             lines.append(
-                f"Genap/Ganjil: <b>{gj_labels[gj_choice]}</b> (confidence: {gj_confidence:.0%}) — "
-                f"Level {gj_level} — Rp{gj_amount:,}/angka × 50 = Rp{gj_amount*50:,}"
+                f"GJ : <b>{gj_labels[gj_choice]}</b> | conf {gj_confidence:.0%} | "
+                f"Lv {gj_level} | modal {self._idr(gj_amount*50)} | "
+                f"net jika menang {self._net((gj_amount * 100) - (gj_amount * 50))}"
             )
 
-        lines.append(f"Total: Rp{total:,}")
+        lines.append(f"Total modal: {self._idr(total)}")
         await self._send("\n".join(lines))
 
     # ─── Result ──────────────────────────────────────────────────────────────
@@ -111,29 +123,32 @@ class TelegramNotifier:
         bk_labels = {"BE": "BESAR", "KE": "KECIL"}
         gj_labels = {"GE": "GENAP", "GA": "GANJIL"}
 
-        bk_icon = "✅" if win_bk else "❌"
-        gj_icon = "✅" if win_gj else "❌"
-
         total_profit = profit_bk + profit_gj
-        profit_str   = f"+Rp{total_profit:,}" if total_profit >= 0 else f"-Rp{abs(total_profit):,}"
+        balance_line = f" | Saldo {self._idr(balance)}" if balance is not None else ""
 
-        bk_line = (
-            f"{bk_icon} Besar/Kecil: {bk_labels.get(actual_bk, actual_bk)}"
-            + (f" (bet: {bk_labels.get(bet_bk, bet_bk)})" if bet_bk else "")
-        )
-        gj_line = (
-            f"{gj_icon} Genap/Ganjil: {gj_labels.get(actual_gj, actual_gj)}"
-            + (f" (bet: {gj_labels.get(bet_gj, bet_gj)})" if bet_gj else "")
-        )
+        lines = [
+            f"📊 {self._title(f'HASIL Periode {periode}')}",
+            f"4D: <b>{full_result}</b> | 2D {BET_TARGET}: <b>{result_2d}</b>",
+        ]
 
-        balance_line = f" | Saldo: Rp{balance:,}" if balance else ""
+        if bet_bk:
+            lines.append(
+                f"BK : bet {bk_labels.get(bet_bk, bet_bk)} | hasil {bk_labels.get(actual_bk, actual_bk)} | "
+                f"{'MENANG' if win_bk else 'KALAH'} | net {self._net(profit_bk)}"
+            )
+        else:
+            lines.append(f"BK : SKIP | hasil {bk_labels.get(actual_bk, actual_bk)}")
 
-        text = (
-            f"📊 {self._title(f'HASIL Periode {periode}')}: <b>{full_result}</b> (2D {BET_TARGET}={result_2d})\n"
-            f"→ {bk_line}\n"
-            f"→ {gj_line}\n"
-            f"Profit: {profit_str}{balance_line}"
-        )
+        if bet_gj:
+            lines.append(
+                f"GJ : bet {gj_labels.get(bet_gj, bet_gj)} | hasil {gj_labels.get(actual_gj, actual_gj)} | "
+                f"{'MENANG' if win_gj else 'KALAH'} | net {self._net(profit_gj)}"
+            )
+        else:
+            lines.append(f"GJ : SKIP | hasil {gj_labels.get(actual_gj, actual_gj)}")
+
+        lines.append(f"Net periode: <b>{self._net(total_profit)}</b>{balance_line}")
+        text = "\n".join(lines)
         await self._send(text)
 
     # ─── Daily summary ───────────────────────────────────────────────────────
@@ -149,14 +164,13 @@ class TelegramNotifier:
         ending_balance: Optional[int] = None,
     ) -> None:
         win_rate   = (total_wins / total_bets * 100) if total_bets else 0
-        profit_str = f"+Rp{profit:,}" if profit >= 0 else f"-Rp{abs(profit):,}"
-        bal_line   = f" | Saldo: Rp{ending_balance:,}" if ending_balance else ""
+        bal_line   = f" | Saldo {self._idr(ending_balance)}" if ending_balance is not None else ""
 
         text = (
             f"📈 {self._title('Ringkasan Hari Ini')} — {date}\n"
-            f"Periode: {total_bets} bet | Win: {total_wins}/{total_bets} ({win_rate:.1f}%)\n"
-            f"Total Bet: Rp{total_bet_amount:,} | Total Win: Rp{total_win_amount:,}\n"
-            f"Profit: {profit_str}{bal_line}"
+            f"Bet settle: {total_bets} | Menang: {total_wins}/{total_bets} ({win_rate:.1f}%)\n"
+            f"Modal: {self._idr(total_bet_amount)} | Payout: {self._idr(total_win_amount)}\n"
+            f"Net: <b>{self._net(profit)}</b>{bal_line}"
         )
         await self._send(text)
 
