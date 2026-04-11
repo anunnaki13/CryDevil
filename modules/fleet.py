@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
+from uuid import uuid4
 from typing import Any
 
 from config import FLEET_SHARED_DIR, FLEET_BOT_NAMES, INSTANCE_NAME, BET_TARGET
@@ -44,6 +45,10 @@ def fleet_state_path() -> str:
 
 def fleet_plan_path() -> str:
     return _path("fleet_plan.json")
+
+
+def fleet_command_path() -> str:
+    return _path("fleet_commands.json")
 
 
 def get_fleet_state() -> dict[str, Any]:
@@ -109,3 +114,59 @@ def write_plan(plan: dict[str, Any]) -> None:
 
 def read_plan() -> dict[str, Any]:
     return _read_json(fleet_plan_path(), {})
+
+
+def get_fleet_commands() -> dict[str, Any]:
+    return _read_json(fleet_command_path(), {"commands": {}})
+
+
+def enqueue_bet_now(period: str, requested_by: str = INSTANCE_NAME) -> dict[str, Any]:
+    state = get_fleet_commands()
+    commands = state.setdefault("commands", {})
+    active = commands.get("bet_now")
+    if active and active.get("period") == period and not active.get("completed_at"):
+        return active
+
+    payload = {
+        "command_id": uuid4().hex,
+        "action": "bet_now",
+        "period": period,
+        "requested_by": requested_by,
+        "created_at": datetime.now(_UTC).isoformat(),
+        "processed_by": {},
+    }
+    commands["bet_now"] = payload
+    _atomic_write_json(fleet_command_path(), state)
+    return payload
+
+
+def get_pending_bet_now() -> dict[str, Any] | None:
+    command = get_fleet_commands().get("commands", {}).get("bet_now")
+    if not command or command.get("completed_at"):
+        return None
+    return command
+
+
+def mark_bet_now_processed(
+    bot_name: str,
+    status: str,
+    note: str = "",
+    command_id: str | None = None,
+) -> dict[str, Any] | None:
+    state = get_fleet_commands()
+    command = state.setdefault("commands", {}).get("bet_now")
+    if not command:
+        return None
+    if command_id and command.get("command_id") != command_id:
+        return command
+
+    processed = command.setdefault("processed_by", {})
+    processed[bot_name] = {
+        "status": status,
+        "note": note,
+        "processed_at": datetime.now(_UTC).isoformat(),
+    }
+    if all(name in processed for name in FLEET_BOT_NAMES):
+        command["completed_at"] = datetime.now(_UTC).isoformat()
+    _atomic_write_json(fleet_command_path(), state)
+    return command

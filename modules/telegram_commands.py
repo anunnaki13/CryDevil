@@ -93,12 +93,14 @@ class TelegramCommands:
         scraper: Optional[Scraper] = None,
         predictor: Optional[Predictor] = None,
         signal_snapshot_writer: Optional[Callable[..., Awaitable[None]]] = None,
+        bet_now_requester: Optional[Callable[[], Awaitable[str]]] = None,
     ) -> None:
         self._auth = auth
         self._mm = money_manager
         self._scraper = scraper
         self._predictor = predictor
         self._signal_snapshot_writer = signal_snapshot_writer
+        self._bet_now_requester = bet_now_requester
         self._app: Optional[Application] = None
         self._paused = False
         self._last_predict_at: Optional[datetime] = None
@@ -159,6 +161,7 @@ class TelegramCommands:
             "/level    — Level martingale BK & GJ\n"
             "/signal X — Snapshot prediksi bot tertentu\n"
             "/predict  — Analisis manual tanpa pasang bet\n"
+            "/betnow   — Pasang bet sekarang untuk periode aktif\n"
             "/bots     — Status fleet bot\n"
             "/bot_on X — Aktifkan bot tertentu\n"
             "/bot_off X — Matikan bot tertentu\n"
@@ -531,6 +534,18 @@ class TelegramCommands:
         )
         await update.message.reply_text(text, parse_mode="HTML")
 
+    async def _cmd_betnow(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update):
+            return
+
+        if self._bet_now_requester is None:
+            await update.message.reply_text("Fitur betnow belum terhubung di instance ini.")
+            return
+
+        await update.message.reply_text("Memproses BET NOW untuk periode aktif.")
+        result = await self._bet_now_requester()
+        await update.message.reply_text(result, parse_mode="HTML")
+
     # ─── /pause & /resume ────────────────────────────────────────────────────
 
     async def _cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -653,6 +668,7 @@ class TelegramCommands:
         self._app.add_handler(CommandHandler("level", self._cmd_level))
         self._app.add_handler(CommandHandler("signal", self._cmd_signal))
         self._app.add_handler(CommandHandler("predict", self._cmd_predict))
+        self._app.add_handler(CommandHandler("betnow", self._cmd_betnow))
         self._app.add_handler(CommandHandler("bots", self._cmd_bots))
         self._app.add_handler(CommandHandler("bot_on", self._cmd_bot_on))
         self._app.add_handler(CommandHandler("bot_off", self._cmd_bot_off))
@@ -670,6 +686,7 @@ class TelegramCommands:
             BotCommand("level", "Level martingale BK & GJ"),
             BotCommand("signal", "Snapshot prediksi terakhir"),
             BotCommand("predict", "Analisis manual tanpa bet"),
+            BotCommand("betnow", "Bet sekarang untuk periode aktif"),
             BotCommand("bots", "Status fleet bot"),
             BotCommand("bot_on", "Aktifkan bot tertentu"),
             BotCommand("bot_off", "Matikan bot tertentu"),
