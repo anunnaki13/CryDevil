@@ -263,12 +263,47 @@ class Predictor:
                 temperature=LLM_TEMPERATURE,
                 max_tokens=LLM_MAX_TOKENS,
             )
-            content = response.choices[0].message.content
+            if not response.choices:
+                logger.warning("LLM response kosong (%s): tanpa choices", model)
+                return None
+
+            message = response.choices[0].message
+            if message is None:
+                logger.warning("LLM response kosong (%s): message=None", model)
+                return None
+
+            content = self._coerce_message_content(message.content)
+            if not content:
+                logger.warning("LLM response kosong (%s): content kosong/tidak didukung", model)
+                return None
+
             logger.debug("LLM raw (%s): %s", model, content[:300])
             return self._extract_json(content)
         except Exception as e:
             logger.error("LLM call gagal (%s): %s", model, e)
             return None
+
+    def _coerce_message_content(self, content: object) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    if item.strip():
+                        parts.append(item.strip())
+                    continue
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text.strip())
+                    continue
+
+                item_text = getattr(item, "text", None)
+                if isinstance(item_text, str) and item_text.strip():
+                    parts.append(item_text.strip())
+            return "\n".join(parts).strip()
+        return ""
 
     def _parse_fleet_response(self, data: dict) -> Optional[dict]:
         if not isinstance(data, dict):
