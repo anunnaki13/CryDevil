@@ -23,7 +23,7 @@ def _path(name: str) -> str:
 
 
 def _atomic_write_json(path: str, data: dict[str, Any]) -> None:
-    tmp = f"{path}.tmp"
+    tmp = f"{path}.{os.getpid()}.{uuid4().hex}.tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=True, indent=2, sort_keys=True)
     os.replace(tmp, path)
