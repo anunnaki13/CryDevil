@@ -73,6 +73,7 @@ class TelegramNotifier:
         gj_amount: int,
         bk_level: Optional[int],
         gj_level: Optional[int],
+        balance: Optional[int] = None,
         dry_run: bool = False,
     ) -> None:
         mode       = "[DRY RUN] " if dry_run else ""
@@ -101,6 +102,8 @@ class TelegramNotifier:
             )
 
         lines.append(f"Total modal: {self._idr(total)}")
+        if balance is not None:
+            lines.append(f"Saldo saat ini: {self._idr(balance)}")
         await self._send("\n".join(lines))
 
     # ─── Result ──────────────────────────────────────────────────────────────

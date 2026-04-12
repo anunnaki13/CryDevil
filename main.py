@@ -398,6 +398,14 @@ class HokidrawBot:
         self._last_period = periode
         await db.set_state("last_period", periode)
 
+        balance_after = None
+        try:
+            balance_after = await self.auth.get_balance()
+        except Exception as exc:
+            logger.warning("[%s] Gagal refresh saldo setelah bet: %s", INSTANCE_LABEL, exc)
+        if balance_after is not None:
+            await self._publish_snapshot(balance=balance_after)
+
         # 11. Notifikasi
         await self.notifier.notify_bet_placed(
             periode=periode,
@@ -409,6 +417,7 @@ class HokidrawBot:
             gj_amount=gj_amount,
             bk_level=bk_level if bk_resp else None,
             gj_level=gj_level if gj_resp else None,
+            balance=balance_after,
             dry_run=self.dry_run,
         )
         return True, f"bet_placed:{periode}"
