@@ -80,7 +80,7 @@ PASSWORD = _require("PARTAI_PASSWORD")
 # ─── 3. OpenRouter LLM ───────────────────────────────────────────────────────
 OPENROUTER_API_KEY  = _require("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-LLM_PRIMARY         = _optional("LLM_MODEL",         "google/gemini-2.0-flash-001")
+LLM_PRIMARY         = _optional("LLM_MODEL",         "minimax/minimax-m2.5")
 LLM_FALLBACK        = _optional("LLM_FALLBACK_MODEL", "anthropic/claude-sonnet-4-20250514")
 LLM_TEMPERATURE     = _float("LLM_TEMPERATURE", 0.3)
 LLM_MAX_TOKENS      = 1000

@@ -231,7 +231,7 @@ Bot mendukung perintah interaktif via Telegram. Ketik `/` di chat untuk melihat 
 
 | Setting | Default | Keterangan |
 |---|---|---|
-| `LLM_MODEL` | `google/gemini-2.0-flash-001` | Model utama (daftar model di openrouter.ai) |
+| `LLM_MODEL` | `minimax/minimax-m2.5` | Model utama (daftar model di openrouter.ai) |
 | `LLM_FALLBACK_MODEL` | `anthropic/claude-sonnet-4-20250514` | Model cadangan jika utama gagal |
 | `LLM_TEMPERATURE` | `0.3` | 0.0 = deterministik · 1.0 = paling acak |
 
