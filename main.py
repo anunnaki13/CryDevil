@@ -168,7 +168,7 @@ class HokidrawBot:
         forced_period: str | None = None,
         trigger: str = "scheduled",
     ) -> tuple[bool, str]:
-        is_manual_betnow = trigger == "betnow"
+        force_fleet_execution = FLEET_SHARED_ANALYSIS and trigger in ("betnow", "scheduled")
         # 4. Cek daily limit
         if not await self.mm.check_and_enforce_daily_limit():
             await self.notifier.send_limit_reached(
@@ -231,7 +231,7 @@ class HokidrawBot:
                     INSTANCE_NAME, BET_TARGET, my_plan.get("target")
                 )
                 return False, "plan_target_mismatch"
-            if my_plan.get("action") != "BET" and not is_manual_betnow:
+            if my_plan.get("action") != "BET" and not force_fleet_execution:
                 logger.info("Plan fleet memutuskan SKIP untuk %s: %s", INSTANCE_NAME, my_plan.get("note", ""))
                 await self._store_signal_snapshot(
                     periode,
@@ -242,11 +242,12 @@ class HokidrawBot:
                     note=my_plan.get("note", trigger),
                 )
                 return False, f"fleet_skip:{periode}"
-            if my_plan.get("action") != "BET" and is_manual_betnow:
+            if my_plan.get("action") != "BET" and force_fleet_execution:
                 logger.info(
-                    "[%s] BET NOW override plan SKIP untuk %s: %s",
+                    "[%s] Fleet override plan SKIP untuk %s (%s): %s",
                     INSTANCE_LABEL,
                     INSTANCE_NAME,
+                    trigger,
                     my_plan.get("note", ""),
                 )
 
@@ -320,7 +321,7 @@ class HokidrawBot:
             chosen_dimension, chosen_data = self._pick_single_candidate(bk_data, gj_data)
             chosen_conf = chosen_data["confidence"]
 
-            if chosen_conf < MIN_CONFIDENCE_TO_BET and not is_manual_betnow:
+            if chosen_conf < MIN_CONFIDENCE_TO_BET and not force_fleet_execution:
                 logger.info(
                     "[%s] Skip bet: confidence tertinggi %.0f%% masih di bawah threshold %.0f%%",
                     INSTANCE_LABEL,
@@ -343,12 +344,13 @@ class HokidrawBot:
                     note=f"below_threshold:{trigger}",
                 )
                 return False, f"below_threshold:{periode}"
-            if chosen_conf < MIN_CONFIDENCE_TO_BET and is_manual_betnow:
+            if chosen_conf < MIN_CONFIDENCE_TO_BET and force_fleet_execution:
                 logger.info(
-                    "[%s] BET NOW override threshold %.0f%% < %.0f%%",
+                    "[%s] Fleet override threshold %.0f%% < %.0f%% (%s)",
                     INSTANCE_LABEL,
                     chosen_conf * 100,
                     MIN_CONFIDENCE_TO_BET * 100,
+                    trigger,
                 )
 
             await self._store_signal_snapshot(
@@ -411,6 +413,15 @@ class HokidrawBot:
         )
         return True, f"bet_placed:{periode}"
 
+    async def _dispatch_scheduled_fleet_command(self, period: str, leader_note: str) -> None:
+        command = fleet.enqueue_bet_now(period, requested_by=f"scheduled:{INSTANCE_NAME}")
+        fleet.mark_bet_now_processed(
+            INSTANCE_NAME,
+            "bet_placed" if leader_note.startswith("bet_placed:") else "skipped",
+            leader_note,
+            command_id=command.get("command_id"),
+        )
+
     # ─── Siklus utama ─────────────────────────────────────────────────────────
 
     async def hourly_cycle(self) -> None:
@@ -452,7 +463,11 @@ class HokidrawBot:
             else:
                 logger.warning("Tidak ada result baru setelah %s polling", MAX_POLL_ATTEMPTS)
 
-            await self._execute_bet_flow(now=now, trigger="scheduled")
+            success, note = await self._execute_bet_flow(now=now, trigger="scheduled")
+            if FLEET_SHARED_ANALYSIS and FLEET_ROLE == "leader" and (success or note.startswith("already_bet:")):
+                period = note.split(":", 1)[1] if ":" in note else None
+                if period:
+                    await self._dispatch_scheduled_fleet_command(period, note)
 
     async def request_bet_now(self) -> str:
         if self._cycle_lock.locked():
