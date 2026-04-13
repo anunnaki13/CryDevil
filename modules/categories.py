@@ -24,6 +24,17 @@ CHOICE_LABELS = {
     "GA": "GANJIL",
 }
 
+POSITION_LABELS = {
+    "depan": "DEPAN",
+    "tengah": "TENGAH",
+    "belakang": "BELAKANG",
+}
+
+DIMENSION_LABELS = {
+    "besar_kecil": "BK",
+    "genap_ganjil": "GJ",
+}
+
 BK_CHOICES = ("BE", "KE")
 GJ_CHOICES = ("GE", "GA")
 
@@ -123,6 +134,12 @@ def get_target_result(parsed: dict, target: str) -> dict:
         "besar_kecil": parsed[f"{target}_bk"],
         "genap_ganjil": parsed[f"{target}_gj"],
     }
+
+
+def format_slot(slot: str) -> str:
+    target, suffix = slot.rsplit("_", 1)
+    dim = "besar_kecil" if suffix == "bk" else "genap_ganjil"
+    return f"{POSITION_LABELS.get(target, target)} {DIMENSION_LABELS[dim]}"
 
 
 # ─── Generator angka per kategori ─────────────────────────────────────────────

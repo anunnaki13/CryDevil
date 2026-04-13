@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 
 from config import (
     BASE_URL, POOL_ID, GAME_TYPE, TIMER_API_URL,
-    AJAX_HEADERS, HEADERS,
+    AJAX_HEADERS, HEADERS, HISTORY_FETCH_MAX_PAGES,
 )
 from modules.auth import AuthManager
 
@@ -160,7 +160,7 @@ class Scraper:
         client = await self._client()
         parsed = []
         per_page = 10
-        pages_needed = min((limit + per_page - 1) // per_page, 30)  # cap at 30 pages
+        pages_needed = min((limit + per_page - 1) // per_page, HISTORY_FETCH_MAX_PAGES)
 
         for page in range(1, pages_needed + 1):
             try:

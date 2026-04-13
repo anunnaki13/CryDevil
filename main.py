@@ -1,59 +1,45 @@
 """
-Hokidraw 2D Auto-Betting Bot
-=============================
-Otomatis prediksi dan pasang taruhan BESAR/KECIL + GENAP/GANJIL
-pada 2D Belakang pasaran Hokidraw (partai34848.com).
+Hokidraw single-bot multi-position auto-betting bot.
 
-Cara kerja per jam:
-  1. Tunggu hasil draw periode sebelumnya
-  2. Klasifikasi hasil → catat menang/kalah → update martingale BK & GJ
-  3. Ambil history 200 periode → kirim ke LLM via OpenRouter
-  4. LLM prediksi BE/KE dan GE/GA + confidence
-  5. Pasang 2 bet (BK + GJ), masing-masing 50 angka
-  6. Telegram notifikasi
-
-Usage:
-    python main.py                # live
-    python main.py --dry-run      # test tanpa bet sungguhan
-    python main.py --check-config # cek .env saja
+Bot menganalisis 2D depan, tengah, dan belakang sekaligus.
+Untuk setiap posisi, bot menilai BK dan GJ, lalu hanya memasang
+satu taruhan terbaik berdasarkan confidence tertinggi global.
 """
 
-import asyncio
 import argparse
+import asyncio
 import json
 import logging
-import sys
 import os
-from datetime import datetime, timezone, timedelta
+import sys
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from config import (
-    POLL_START_MINUTE, POLL_INTERVAL_SECONDS, MAX_POLL_ATTEMPTS,
-    BET_DEADLINE_MINUTE, DAILY_LOSS_LIMIT,
-    LOG_PATH, BET_MODE, BET_TARGET, INSTANCE_LABEL,
-    MIN_CONFIDENCE_TO_BET,
-    FLEET_SHARED_ANALYSIS, FLEET_ROLE, INSTANCE_NAME,
-    FLEET_SNAPSHOT_REFRESH_SECONDS,
-    FLEET_COMMAND_POLL_SECONDS,
+    BACKLOG_RECOVERY_LIMIT,
+    DAILY_LOSS_LIMIT,
+    DEFAULT_OPERATION_MODE,
+    HISTORY_WINDOW,
+    INSTANCE_LABEL,
+    LOG_PATH,
+    MAX_POLL_ATTEMPTS,
+    POLL_INTERVAL_SECONDS,
+    POLL_START_MINUTE,
+    BET_DEADLINE_MINUTE,
     validate_config,
 )
 from modules import database as db
 from modules.auth import AuthManager
-from modules.scraper import Scraper
-from modules.predictor import Predictor
 from modules.bettor import Bettor
+from modules.categories import get_target_result, parse_result_full
 from modules.money_manager import MoneyManager
 from modules.notifier import TelegramNotifier
-from modules.categories import (
-    get_target_result, parse_result_full, result_summary,
-)
+from modules.predictor import Predictor
+from modules.scraper import Scraper
 from modules.telegram_commands import TelegramCommands
-from modules import fleet
-
-# ─── Logging ─────────────────────────────────────────────────────────────────
 
 _log_dir = os.path.dirname(LOG_PATH)
 if _log_dir:
@@ -62,10 +48,7 @@ if _log_dir:
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(LOG_PATH, encoding="utf-8"),
-    ],
+    handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler(LOG_PATH, encoding="utf-8")],
 )
 logger = logging.getLogger("hokidraw.main")
 
@@ -80,18 +63,16 @@ def _today_wib() -> str:
     return _now_wib().strftime("%Y-%m-%d")
 
 
-# ─── Bot ─────────────────────────────────────────────────────────────────────
-
 class HokidrawBot:
     def __init__(self, dry_run: bool = False) -> None:
-        self.dry_run       = dry_run
-        self.auth          = AuthManager()
-        self.scraper       = Scraper(self.auth)
-        self.predictor     = Predictor()
-        self.bettor        = Bettor(self.auth)
-        self.mm            = MoneyManager()
-        self.notifier      = TelegramNotifier()
-        self.tg_commands   = TelegramCommands(
+        self.dry_run = dry_run
+        self.auth = AuthManager()
+        self.scraper = Scraper(self.auth)
+        self.predictor = Predictor()
+        self.bettor = Bettor(self.auth)
+        self.mm = MoneyManager()
+        self.notifier = TelegramNotifier()
+        self.tg_commands = TelegramCommands(
             self.auth,
             self.mm,
             scraper=self.scraper,
@@ -102,63 +83,34 @@ class HokidrawBot:
         self._last_period: Optional[str] = None
         self._cycle_lock = asyncio.Lock()
 
-    @staticmethod
-    def _pick_single_candidate(bk_data: dict, gj_data: dict) -> tuple[str, dict]:
-        if bk_data["confidence"] >= gj_data["confidence"]:
-            return "besar_kecil", bk_data
-        return "genap_ganjil", gj_data
-
     async def _store_signal_snapshot(
         self,
-        periode: str,
-        bk_data: dict,
-        gj_data: dict,
-        source: str,
+        period: str,
+        prediction: dict,
+        *,
+        selected: dict | None,
         decision: str,
-        selected_dimension: str | None = None,
-        selected_choice: str | None = None,
-        selected_confidence: float | None = None,
-        note: str | None = None,
+        source: str,
+        note: str = "",
+        threshold: float | None = None,
     ) -> None:
+        if threshold is None:
+            threshold = (await self.mm.get_operation_profile())["threshold"]
         payload = {
-            "period": periode,
-            "target": BET_TARGET,
+            "period": period,
             "source": source,
             "decision": decision,
-            "selected_dimension": selected_dimension,
-            "selected_choice": selected_choice,
-            "selected_confidence": selected_confidence,
-            "threshold": MIN_CONFIDENCE_TO_BET,
-            "besar_kecil": {
-                "choice": bk_data.get("choice"),
-                "confidence": bk_data.get("confidence"),
-                "reason": bk_data.get("reason", ""),
-            },
-            "genap_ganjil": {
-                "choice": gj_data.get("choice"),
-                "confidence": gj_data.get("confidence"),
-                "reason": gj_data.get("reason", ""),
-            },
-            "note": note or "",
+            "selected_slot": selected.get("slot") if selected else None,
+            "selected_target": selected.get("target") if selected else None,
+            "selected_dimension": selected.get("dimension") if selected else None,
+            "selected_choice": selected.get("choice") if selected else None,
+            "selected_confidence": selected.get("confidence") if selected else None,
+            "threshold": threshold,
+            "positions": prediction.get("positions", {}),
+            "ranking": prediction.get("ranking", []),
+            "note": note,
         }
         await db.set_state("last_signal_snapshot", json.dumps(payload, ensure_ascii=True))
-        fleet.update_snapshot({"last_signal_snapshot": payload})
-
-    async def _publish_snapshot(self, balance: Optional[int] = None) -> None:
-        summary = await self.mm.get_status_summary()
-        fleet.update_snapshot({
-            "instance_label": INSTANCE_LABEL,
-            "target": BET_TARGET,
-            "enabled": fleet.is_bot_enabled(INSTANCE_NAME),
-            "paused": fleet.is_bot_paused(INSTANCE_NAME) or self.tg_commands.is_paused,
-            "balance": balance if balance is not None else await self.auth.get_balance(),
-            "daily_loss": summary["daily_loss"],
-            "bk_level": summary["bk_level"],
-            "gj_level": summary["gj_level"],
-            "bk_bet": summary["bk_bet"],
-            "gj_bet": summary["gj_bet"],
-            "mode": BET_MODE,
-        })
 
     async def _execute_bet_flow(
         self,
@@ -168,270 +120,117 @@ class HokidrawBot:
         forced_period: str | None = None,
         trigger: str = "scheduled",
     ) -> tuple[bool, str]:
-        force_fleet_execution = FLEET_SHARED_ANALYSIS and trigger in ("betnow", "scheduled")
-        # 4. Cek daily limit
         if not await self.mm.check_and_enforce_daily_limit():
-            await self.notifier.send_limit_reached(
-                await self.mm.get_daily_loss(), DAILY_LOSS_LIMIT
-            )
+            already_notified = await db.get_state("daily_limit_notified", "0")
+            if already_notified != "1":
+                await self.notifier.send_limit_reached(await self.mm.get_daily_loss(), DAILY_LOSS_LIMIT)
+                await db.set_state("daily_limit_notified", "1")
             return False, "daily_limit"
 
-        # 5. Cek window waktu betting
         if not allow_after_deadline and now.minute > BET_DEADLINE_MINUTE:
             logger.info("Lewat deadline menit :%02d — skip bet", BET_DEADLINE_MINUTE)
             return False, "past_deadline"
 
-        # 6. Ambil history dan prediksi LLM/plan fleet
         history = await self.scraper.get_draw_history()
         if not history:
             await self.notifier.notify_alert("Gagal ambil history draw")
             return False, "history_failed"
 
-        # 7. Ambil periode saat ini
-        periode = forced_period or await self.scraper.get_current_periode()
-        if not periode:
+        period = forced_period or await self.scraper.get_current_periode()
+        if not period:
             await self.notifier.notify_alert("Gagal ambil periode saat ini")
             return False, "period_failed"
+        if period == self._last_period:
+            logger.info("Skip bet: periode %s sudah pernah dibet sebelumnya", period)
+            return False, f"already_bet:{period}"
 
-        if periode == self._last_period:
-            logger.info("Sudah bet di periode %s — skip", periode)
-            return False, f"already_bet:{periode}"
+        profile = await self.mm.get_operation_profile()
+        threshold = float(profile["threshold"])
+        prediction = await self.predictor.analyze(history)
+        if prediction is None or not prediction.get("ranking"):
+            await self.notifier.notify_alert("Prediksi gagal")
+            return False, "prediction_failed"
 
-        my_plan = None
-        if FLEET_SHARED_ANALYSIS:
-            fleet_plan = None
-            if FLEET_ROLE == "leader":
-                snapshots = fleet.get_snapshots()
-                fleet_plan = await self.predictor.analyze_fleet(history, snapshots)
-                if fleet_plan is None:
-                    await self.notifier.notify_alert("LLM fleet analysis gagal")
-                    return False, "fleet_analysis_failed"
-                fleet.write_plan({
-                    "period": periode,
-                    **fleet_plan,
-                })
-            else:
-                for _ in range(10):
-                    candidate = fleet.read_plan()
-                    if candidate.get("period") == periode:
-                        fleet_plan = candidate
-                        break
-                    await asyncio.sleep(2)
-                if fleet_plan is None:
-                    await self.notifier.notify_alert("Plan fleet belum tersedia untuk periode ini")
-                    return False, "fleet_plan_unavailable"
-
-            my_plan = (fleet_plan.get("bots") or {}).get(INSTANCE_NAME)
-            if not my_plan:
-                logger.warning("Tidak ada plan untuk bot %s", INSTANCE_NAME)
-                return False, "missing_plan"
-            if my_plan.get("target") != BET_TARGET:
-                logger.warning(
-                    "Plan target mismatch untuk %s: expected=%s actual=%s",
-                    INSTANCE_NAME, BET_TARGET, my_plan.get("target")
-                )
-                return False, "plan_target_mismatch"
-            if my_plan.get("action") != "BET" and not force_fleet_execution:
-                logger.info("Plan fleet memutuskan SKIP untuk %s: %s", INSTANCE_NAME, my_plan.get("note", ""))
-                await self._store_signal_snapshot(
-                    periode,
-                    my_plan["besar_kecil"],
-                    my_plan["genap_ganjil"],
-                    source="fleet",
-                    decision="SKIP",
-                    note=my_plan.get("note", trigger),
-                )
-                return False, f"fleet_skip:{periode}"
-            if my_plan.get("action") != "BET" and force_fleet_execution:
-                logger.info(
-                    "[%s] Fleet override plan SKIP untuk %s (%s): %s",
-                    INSTANCE_LABEL,
-                    INSTANCE_NAME,
-                    trigger,
-                    my_plan.get("note", ""),
-                )
-
-            bk_data = my_plan["besar_kecil"]
-            gj_data = my_plan["genap_ganjil"]
-            logger.info(
-                "[%s] Fleet plan %s (%s) → BK: %s (%.0f%%) | GJ: %s (%.0f%%) | risk=%s",
-                INSTANCE_LABEL,
-                BET_TARGET,
-                trigger,
-                bk_data["choice"], bk_data["confidence"] * 100,
-                gj_data["choice"], gj_data["confidence"] * 100,
-                my_plan.get("mode_risiko", "normal"),
-            )
-        else:
-            prediction = await self.predictor.analyze(history)
-            if prediction is None:
-                await self.notifier.notify_alert("LLM prediction gagal")
-                return False, "prediction_failed"
-
-            bk_data = prediction["besar_kecil"]
-            gj_data = prediction["genap_ganjil"]
-
-            logger.info(
-                "[%s] Prediksi %s (%s) → BK: %s (%.0f%%) | GJ: %s (%.0f%%)",
-                INSTANCE_LABEL,
-                BET_TARGET,
-                trigger,
-                bk_data["choice"], bk_data["confidence"] * 100,
-                gj_data["choice"], gj_data["confidence"] * 100,
-            )
-            await self._store_signal_snapshot(
-                periode,
-                bk_data,
-                gj_data,
-                source="single",
-                decision="ANALYZED",
-                note=trigger,
-            )
-
-        # 8. Ambil bet amount dari money manager (per dimensi)
-        bk_amount = await self.mm.get_bet_amount("besar_kecil")
-        gj_amount = await self.mm.get_bet_amount("genap_ganjil")
-        bk_level = await self.mm.get_level("besar_kecil")
-        gj_level = await self.mm.get_level("genap_ganjil")
-        effective_bet_mode = BET_MODE
-        if FLEET_SHARED_ANALYSIS and FLEET_ROLE in ("leader", "worker") and my_plan:
-            if my_plan.get("mode_risiko") == "conservative":
-                effective_bet_mode = "single"
-
-        # 9. Pasang bet
-        if effective_bet_mode == "double":
-            await self._store_signal_snapshot(
-                periode,
-                bk_data,
-                gj_data,
-                source="fleet" if FLEET_SHARED_ANALYSIS else "single",
-                decision="BET",
-                selected_dimension="double",
-                selected_choice=f"BK:{bk_data['choice']} | GJ:{gj_data['choice']}",
-                selected_confidence=max(bk_data["confidence"], gj_data["confidence"]),
-                note=trigger,
-            )
-            results = await self.bettor.place_double_bet(
-                bk_data["choice"], gj_data["choice"],
-                bk_amount, gj_amount,
-                dry_run=self.dry_run,
-            )
-            bk_resp, gj_resp = results[0], results[1]
-        else:
-            chosen_dimension, chosen_data = self._pick_single_candidate(bk_data, gj_data)
-            chosen_conf = chosen_data["confidence"]
-
-            if chosen_conf < MIN_CONFIDENCE_TO_BET and not force_fleet_execution:
-                logger.info(
-                    "[%s] Skip bet: confidence tertinggi %.0f%% masih di bawah threshold %.0f%%",
-                    INSTANCE_LABEL,
-                    chosen_conf * 100,
-                    MIN_CONFIDENCE_TO_BET * 100,
-                )
-                await self.notifier.notify_alert(
-                    "Skip bet: confidence tertinggi "
-                    f"{chosen_conf:.0%} masih di bawah threshold {MIN_CONFIDENCE_TO_BET:.0%}"
-                )
-                await self._store_signal_snapshot(
-                    periode,
-                    bk_data,
-                    gj_data,
-                    source="fleet" if FLEET_SHARED_ANALYSIS else "single",
-                    decision="SKIP",
-                    selected_dimension=chosen_dimension,
-                    selected_choice=chosen_data["choice"],
-                    selected_confidence=chosen_conf,
-                    note=f"below_threshold:{trigger}",
-                )
-                return False, f"below_threshold:{periode}"
-            if chosen_conf < MIN_CONFIDENCE_TO_BET and force_fleet_execution:
-                logger.info(
-                    "[%s] Fleet override threshold %.0f%% < %.0f%% (%s)",
-                    INSTANCE_LABEL,
-                    chosen_conf * 100,
-                    MIN_CONFIDENCE_TO_BET * 100,
-                    trigger,
-                )
-
-            await self._store_signal_snapshot(
-                periode,
-                bk_data,
-                gj_data,
-                source="fleet" if FLEET_SHARED_ANALYSIS else "single",
-                decision="BET",
-                selected_dimension=chosen_dimension,
-                selected_choice=chosen_data["choice"],
-                selected_confidence=chosen_conf,
-                note=trigger,
-            )
-
-            if chosen_dimension == "besar_kecil":
-                bk_resp = await self.bettor.place_bet(bk_data["choice"], bk_amount, self.dry_run)
-                gj_resp = None
-            else:
-                gj_resp = await self.bettor.place_bet(gj_data["choice"], gj_amount, self.dry_run)
-                bk_resp = None
-
-        bk_ok = self.bettor.is_bet_successful(bk_resp)
-        gj_ok = self.bettor.is_bet_successful(gj_resp)
-        if bk_resp is not None and not bk_ok:
-            logger.error("[%s] Bet BK gagal: %s", INSTANCE_LABEL, self.bettor.get_failure_reason(bk_resp))
-        if gj_resp is not None and not gj_ok:
-            logger.error("[%s] Bet GJ gagal: %s", INSTANCE_LABEL, self.bettor.get_failure_reason(gj_resp))
-        if not (bk_ok or gj_ok):
-            if bk_resp is not None:
-                return False, f"bet_failed:{self.bettor.get_failure_reason(bk_resp)}"
-            if gj_resp is not None:
-                return False, f"bet_failed:{self.bettor.get_failure_reason(gj_resp)}"
-            return False, "bet_failed"
-        if not bk_ok:
-            bk_resp = None
-        if not gj_ok:
-            gj_resp = None
-
-        # 10. Simpan ke DB
-        await self._save_bets(
-            periode, bk_data, gj_data, bk_amount, gj_amount,
-            bk_level, gj_level, bk_resp, gj_resp,
+        best = prediction["ranking"][0]
+        await self._store_signal_snapshot(
+            period,
+            prediction,
+            selected=best,
+            decision="ANALYZED",
+            source="auto",
+            note=trigger,
+            threshold=threshold,
         )
 
-        self._last_period = periode
-        await db.set_state("last_period", periode)
+        for item in prediction["ranking"]:
+            await db.save_prediction_run(
+                period,
+                item["slot"],
+                item["target"],
+                item["dimension"],
+                item["choice"],
+                item["confidence"],
+                "auto",
+                selected_for_bet=item["slot"] == best["slot"],
+                reason=item.get("reason", ""),
+            )
 
-        balance_after = None
-        try:
-            balance_after = await self.auth.get_balance()
-        except Exception as exc:
-            logger.warning("[%s] Gagal refresh saldo setelah bet: %s", INSTANCE_LABEL, exc)
-        if balance_after is not None:
-            await self._publish_snapshot(balance=balance_after)
+        if best["confidence"] < threshold:
+            await self._store_signal_snapshot(
+                period,
+                prediction,
+                selected=best,
+                decision="SKIP",
+                source="auto",
+                note="below_threshold",
+                threshold=threshold,
+            )
+            return False, f"below_threshold:{period}"
 
-        # 11. Notifikasi
+        amount = await self.mm.get_bet_amount(best["slot"])
+        level = await self.mm.get_level(best["slot"])
+        response = await self.bettor.place_bet(best["choice"], amount, best["target"], dry_run=self.dry_run)
+        if not self.bettor.is_bet_successful(response):
+            return False, f"bet_failed:{self.bettor.get_failure_reason(response)}"
+
+        await db.save_bet(
+            period=period,
+            target_position=best["target"],
+            dimension=best["dimension"],
+            bet_slot=best["slot"],
+            choice=best["choice"],
+            bet_amount_per_angka=amount,
+            total_amount=amount * 50,
+            martingale_level=level,
+            confidence=best["confidence"],
+            api_response=str(response),
+        )
+
+        self._last_period = period
+        await db.set_state("last_period", period)
+        balance_after = await self.auth.get_balance()
+        await self._store_signal_snapshot(
+            period,
+            prediction,
+            selected=best,
+            decision="BET",
+            source="auto",
+            note=trigger,
+            threshold=threshold,
+        )
         await self.notifier.notify_bet_placed(
-            periode=periode,
-            bk_choice=bk_data["choice"] if bk_resp else None,
-            gj_choice=gj_data["choice"] if gj_resp else None,
-            bk_confidence=bk_data["confidence"] if bk_resp else None,
-            gj_confidence=gj_data["confidence"] if gj_resp else None,
-            bk_amount=bk_amount,
-            gj_amount=gj_amount,
-            bk_level=bk_level if bk_resp else None,
-            gj_level=gj_level if gj_resp else None,
+            periode=period,
+            target_position=best["target"],
+            dimension=best["dimension"],
+            choice=best["choice"],
+            confidence=best["confidence"],
+            amount=amount,
+            level=level,
+            ranking=prediction["ranking"],
             balance=balance_after,
             dry_run=self.dry_run,
         )
-        return True, f"bet_placed:{periode}"
-
-    async def _dispatch_scheduled_fleet_command(self, period: str, leader_note: str) -> None:
-        command = fleet.enqueue_bet_now(period, requested_by=f"scheduled:{INSTANCE_NAME}")
-        fleet.mark_bet_now_processed(
-            INSTANCE_NAME,
-            "bet_placed" if leader_note.startswith("bet_placed:") else "skipped",
-            leader_note,
-            command_id=command.get("command_id"),
-        )
-
-    # ─── Siklus utama ─────────────────────────────────────────────────────────
+        return True, f"bet_placed:{period}"
 
     async def hourly_cycle(self) -> None:
         if self._cycle_lock.locked():
@@ -439,60 +238,44 @@ class HokidrawBot:
             return
 
         async with self._cycle_lock:
-            now = _now_wib()
-            logger.info("=== Siklus mulai @ %s ===", now.strftime("%H:%M WIB"))
-
-            if FLEET_SHARED_ANALYSIS and not fleet.is_bot_enabled(INSTANCE_NAME):
-                logger.info("Bot %s dimatikan dari fleet state — skip siklus ini", INSTANCE_NAME)
-                return
-
-            if self.tg_commands.is_paused or fleet.is_bot_paused(INSTANCE_NAME):
-                logger.info("Bot di-PAUSE via Telegram — skip siklus ini")
-                await self.notifier.notify_alert("Siklus di-skip karena bot sedang PAUSE")
-                return
-
             if not await self.auth.ensure_logged_in():
                 await self.notifier.notify_alert("Login gagal — skip siklus ini")
                 return
 
-            await self._publish_snapshot()
-
-            result = None
+            results = []
             for attempt in range(1, MAX_POLL_ATTEMPTS + 1):
-                result = await self._detect_new_result()
-                if result:
+                results = await self._detect_new_results()
+                if results:
                     break
                 if attempt < MAX_POLL_ATTEMPTS:
-                    logger.debug("Belum ada result baru (%d/%d), tunggu %ds",
-                                 attempt, MAX_POLL_ATTEMPTS, POLL_INTERVAL_SECONDS)
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
-            if result:
-                await self._process_result(result)
+            if results:
+                for result in results:
+                    await self._process_result(result)
             else:
                 logger.warning("Tidak ada result baru setelah %s polling", MAX_POLL_ATTEMPTS)
 
-            success, note = await self._execute_bet_flow(now=now, trigger="scheduled")
-            if FLEET_SHARED_ANALYSIS and FLEET_ROLE == "leader" and (success or note.startswith("already_bet:")):
-                period = note.split(":", 1)[1] if ":" in note else None
-                if period:
-                    await self._dispatch_scheduled_fleet_command(period, note)
+            if self.tg_commands.is_paused:
+                logger.info("Bot sedang PAUSE — settlement tetap jalan, skip bet baru")
+                return
+
+            success, note = await self._execute_bet_flow(now=_now_wib(), trigger="scheduled")
+            logger.info("Hourly cycle selesai: success=%s note=%s", success, note)
 
     async def request_bet_now(self) -> str:
         if self._cycle_lock.locked():
             return "Eksekusi lain masih berjalan. Tunggu beberapa detik lalu coba lagi."
-        if self.tg_commands.is_paused or fleet.is_bot_paused(INSTANCE_NAME):
+        if self.tg_commands.is_paused:
             return "Bot sedang <b>PAUSED</b>. Gunakan /resume dulu."
-        if FLEET_SHARED_ANALYSIS and FLEET_ROLE != "leader":
-            return "BET NOW hanya boleh dipicu dari bot leader."
         if not await self.auth.ensure_logged_in():
-            return "Login gagal atau sesi expired. Coba lagi setelah sesi pulih."
+            return "Login gagal atau sesi expired."
 
         period = await self.scraper.get_current_periode()
         if not period:
-            return "Periode aktif tidak tersedia. Market kemungkinan masih BET CLOSE."
+            return "Periode aktif tidak tersedia."
         if period == self._last_period:
-            return f"Periode <b>{period}</b> sudah pernah dibet. Siklus berikutnya akan skip otomatis."
+            return f"Periode <b>{period}</b> sudah pernah dibet."
 
         async with self._cycle_lock:
             success, note = await self._execute_bet_flow(
@@ -501,101 +284,31 @@ class HokidrawBot:
                 forced_period=period,
                 trigger="betnow",
             )
-
-        if not FLEET_SHARED_ANALYSIS:
-            return (
-                f"BET NOW sukses untuk periode <b>{period}</b>."
-                if success else
-                f"BET NOW tidak memasang bet untuk periode <b>{period}</b> ({note})."
-            )
-
-        command = fleet.enqueue_bet_now(period, requested_by=INSTANCE_NAME)
-        fleet.mark_bet_now_processed(
-            INSTANCE_NAME,
-            "bet_placed" if success else "skipped",
-            note,
-            command_id=command.get("command_id"),
-        )
         return (
-            f"BET NOW fleet dipicu untuk periode <b>{period}</b>.\n"
-            f"Leader: {'bet dipasang' if success else f'tidak pasang ({note})'}.\n"
-            "Worker akan mengeksekusi command ini dalam beberapa detik."
+            f"BET NOW sukses untuk periode <b>{period}</b>."
+            if success else
+            f"BET NOW tidak memasang bet untuk periode <b>{period}</b> ({note})."
         )
 
-    async def process_manual_commands(self) -> None:
-        if not FLEET_SHARED_ANALYSIS:
-            return
-        if self._cycle_lock.locked():
-            return
-        command = fleet.get_pending_bet_now()
-        if not command:
-            return
-        processed = command.get("processed_by", {})
-        if INSTANCE_NAME in processed:
-            return
+    async def _detect_new_results(self, limit: int = BACKLOG_RECOVERY_LIMIT) -> list[dict]:
+        history = await self.scraper.get_draw_history(limit=limit)
+        if not history:
+            return []
 
-        if not fleet.is_bot_enabled(INSTANCE_NAME):
-            fleet.mark_bet_now_processed(
-                INSTANCE_NAME,
-                "skipped",
-                "bot_disabled",
-                command_id=command.get("command_id"),
-            )
-            return
-        if self.tg_commands.is_paused or fleet.is_bot_paused(INSTANCE_NAME):
-            fleet.mark_bet_now_processed(
-                INSTANCE_NAME,
-                "skipped",
-                "bot_paused",
-                command_id=command.get("command_id"),
-            )
-            return
-        if not await self.auth.ensure_logged_in():
-            fleet.mark_bet_now_processed(
-                INSTANCE_NAME,
-                "skipped",
-                "login_failed",
-                command_id=command.get("command_id"),
-            )
-            return
-
-        async with self._cycle_lock:
-            success, note = await self._execute_bet_flow(
-                now=_now_wib(),
-                allow_after_deadline=True,
-                forced_period=command.get("period"),
-                trigger="betnow",
-            )
-            fleet.mark_bet_now_processed(
-                INSTANCE_NAME,
-                "bet_placed" if success else "skipped",
-                note,
-                command_id=command.get("command_id"),
-            )
-
-    # ─── Detect new result ────────────────────────────────────────────────────
-
-    async def _detect_new_result(self) -> Optional[dict]:
-        """Cek apakah ada hasil draw baru yang belum ada di DB."""
-        last = await db.get_last_result()
-        last_period = last["period"] if last else None
-
-        latest = await self.scraper.get_latest_result()
-        if not latest:
-            return None
-
-        # Normalise field names (scraper bisa return "periode" atau "period")
-        period = latest.get("period") or latest.get("periode") or ""
-        if not period or period == last_period:
-            return None
-
-        return latest
-
-    # ─── Process new result ───────────────────────────────────────────────────
+        pending: list[dict] = []
+        for item in reversed(history):
+            period = item.get("period") or item.get("periode") or ""
+            if not period:
+                continue
+            if await db.result_exists(period):
+                continue
+            item.setdefault("period", period)
+            item.setdefault("periode", period)
+            pending.append(item)
+        return pending
 
     async def _process_result(self, raw_result: dict) -> None:
-        """Parse, simpan, settle bets, dan notifikasi hasil draw."""
-        period    = raw_result.get("period") or raw_result.get("periode") or ""
+        period = raw_result.get("period") or raw_result.get("periode") or ""
         result_4d = str(raw_result.get("result", "")).strip()
         draw_time = str(raw_result.get("draw_time", "")).strip()
 
@@ -604,149 +317,48 @@ class HokidrawBot:
             logger.error("Tidak bisa parse result: %s", result_4d)
             return
 
-        target_data = get_target_result(parsed, BET_TARGET)
-        number_2d   = target_data["number_2d"]
-        actual_bk   = target_data["besar_kecil"]
-        actual_gj   = target_data["genap_ganjil"]
+        await db.save_result(period, draw_time, parsed)
+        await db.settle_prediction_runs(period, parsed)
 
-        logger.info("Result %s: %s → %s", period, result_summary(result_4d),
-                    f"{BET_TARGET}=2D {number_2d} {actual_bk}+{actual_gj}")
-
-        # Simpan ke DB
-        await db.save_result(
-            period=period,
-            draw_time=draw_time,
-            full_number=parsed["full"],
-            target_position=BET_TARGET,
-            target_number_2d=number_2d,
-            target_bk=actual_bk,
-            target_gj=actual_gj,
-        )
-
-        # Settle hanya bet untuk periode result ini.
-        # Menggunakan semua pending bets berisiko salah settle jika bot sempat tertinggal beberapa draw.
         pending = await db.get_placed_bets(period)
         for bet in pending:
-            bet_choice = bet["bet_choice"]
-            dimension  = bet["bet_dimension"]
-            amount     = int(bet["bet_amount_per_angka"])
-            won        = self.bettor.check_win(bet_choice, number_2d)
-            payout     = self.bettor.calculate_payout(amount, won)
-
-            status = "won" if won else "lost"
+            target = bet["target_position"]
+            result_2d = parsed[target]
+            actual_choice = parsed[f"{target}_{'bk' if bet['bet_dimension'] == 'besar_kecil' else 'gj'}"]
+            amount = int(bet["bet_amount_per_angka"])
+            won = self.bettor.check_win(bet["bet_choice"], result_2d)
+            payout = self.bettor.calculate_payout(amount, won)
             await db.settle_bet(
                 bet_id=bet["id"],
-                status=status,
+                status="won" if won else "lost",
                 win_amount=payout["won"],
-                result_2d=number_2d,
-                result_match=actual_bk if dimension == "besar_kecil" else actual_gj,
+                result_2d=result_2d,
+                result_match=actual_choice,
             )
-
             if won:
-                await self.mm.record_win(dimension, payout["wagered"], payout["won"])
+                await self.mm.record_win(bet["bet_slot"], payout["wagered"], payout["won"])
             else:
-                await self.mm.record_loss(dimension, payout["wagered"])
+                await self.mm.record_loss(bet["bet_slot"], payout["wagered"])
 
-            logger.info(
-                "Settle %s %s: %s | net=%s",
-                dimension, bet_choice, status, payout["net"],
+            balance = await self.auth.get_balance()
+            await self.notifier.notify_result(
+                periode=period,
+                full_result=parsed["full"],
+                target_position=target,
+                result_2d=result_2d,
+                actual_choice=actual_choice,
+                bet_choice=bet["bet_choice"],
+                won=won,
+                profit=payout["net"],
+                balance=balance,
             )
-
-        # Notifikasi hasil (aggregasi BK + GJ untuk periode yang sama)
-        if pending:
-            await self._notify_result(period, result_4d, number_2d,
-                                      actual_bk, actual_gj, pending)
-
-    async def _notify_result(
-        self,
-        periode: str,
-        full_result: str,
-        result_2d: str,
-        actual_bk: str,
-        actual_gj: str,
-        settled_bets: list[dict],
-    ) -> None:
-        bet_bk = bet_gj = None
-        win_bk = win_gj = False
-        profit_bk = profit_gj = 0
-
-        for bet in settled_bets:
-            dim    = bet["bet_dimension"]
-            amount = int(bet["bet_amount_per_angka"])
-            won    = bet["status"] == "won"
-            payout = self.bettor.calculate_payout(amount, won)
-
-            if dim == "besar_kecil":
-                bet_bk   = bet["bet_choice"]
-                win_bk   = won
-                profit_bk = payout["net"]
-            elif dim == "genap_ganjil":
-                bet_gj   = bet["bet_choice"]
-                win_gj   = won
-                profit_gj = payout["net"]
-
-        balance = await self.auth.get_balance()
-        await self.notifier.notify_result(
-            periode=periode,
-            full_result=full_result,
-            result_2d=result_2d,
-            actual_bk=actual_bk,
-            actual_gj=actual_gj,
-            bet_bk=bet_bk,
-            bet_gj=bet_gj,
-            win_bk=win_bk,
-            win_gj=win_gj,
-            profit_bk=profit_bk,
-            profit_gj=profit_gj,
-            balance=balance,
-        )
-
-    # ─── Save bets ────────────────────────────────────────────────────────────
-
-    async def _save_bets(
-        self,
-        periode: str,
-        bk_data: dict, gj_data: dict,
-        bk_amount: int, gj_amount: int,
-        bk_level: int, gj_level: int,
-        bk_resp: Optional[dict], gj_resp: Optional[dict],
-    ) -> None:
-        if bk_resp is not None:
-            await db.save_bet(
-                period=periode,
-                target_position=BET_TARGET,
-                dimension="besar_kecil",
-                choice=bk_data["choice"],
-                bet_amount_per_angka=bk_amount,
-                total_amount=bk_amount * 50,
-                martingale_level=bk_level,
-                confidence=bk_data["confidence"],
-                api_response=str(bk_resp),
-            )
-
-        if gj_resp is not None:
-            await db.save_bet(
-                period=periode,
-                target_position=BET_TARGET,
-                dimension="genap_ganjil",
-                choice=gj_data["choice"],
-                bet_amount_per_angka=gj_amount,
-                total_amount=gj_amount * 50,
-                martingale_level=gj_level,
-                confidence=gj_data["confidence"],
-                api_response=str(gj_resp),
-            )
-
-    # ─── Daily summary ────────────────────────────────────────────────────────
 
     async def daily_summary(self) -> None:
-        today   = _today_wib()
-        stats   = await db.get_daily_stats(today)
+        today = _today_wib()
+        stats = await db.get_daily_stats(today)
         balance = await self.auth.get_balance()
-
-        if balance:
+        if balance is not None:
             await db.set_daily_ending_balance(today, balance)
-
         if stats:
             await self.notifier.notify_daily_summary(
                 date=today,
@@ -759,41 +371,22 @@ class HokidrawBot:
             )
         else:
             await self.notifier.notify_alert(f"Tidak ada bet hari ini ({today})")
-
         await self.mm.midnight_reset()
-
-    async def refresh_snapshot(self) -> None:
-        """Refresh shared fleet snapshot outside the hourly betting cycle."""
-        try:
-            if not await self.auth.ensure_logged_in():
-                logger.warning("Refresh snapshot skip: login/session tidak valid")
-                return
-            balance = await self.auth.get_balance()
-            await self._publish_snapshot(balance=balance)
-            logger.info("Fleet snapshot diperbarui. Balance: Rp%s", f"{balance:,}" if balance is not None else "?")
-        except Exception:
-            logger.exception("Gagal refresh fleet snapshot")
-
-    # ─── Startup / Shutdown ───────────────────────────────────────────────────
+        await db.set_state("daily_limit_notified", "0")
 
     async def startup(self) -> None:
         await db.init_db()
+        if await db.get_state("operation_mode") is None:
+            await db.set_state("operation_mode", DEFAULT_OPERATION_MODE)
         if not await self.auth.login():
             logger.error("Login awal gagal — cek kredensial di .env")
             sys.exit(1)
         balance = await self.auth.get_balance()
         logger.info("Login OK. Balance: Rp%s", f"{balance:,}" if balance else "?")
-        await self._publish_snapshot(balance=balance)
-
-        # Restore last_period dari DB agar tidak bet duplikat setelah restart
         saved_period = await db.get_state("last_period")
         if saved_period:
             self._last_period = saved_period
-            logger.info("Restored last_period dari DB: %s", saved_period)
-
         await self.notifier.send_startup(dry_run=self.dry_run)
-
-        # Start Telegram command listener
         await self.tg_commands.start()
 
     async def shutdown(self) -> None:
@@ -802,14 +395,11 @@ class HokidrawBot:
         await self.auth.close()
 
 
-# ─── Scheduler ───────────────────────────────────────────────────────────────
-
 async def run(dry_run: bool) -> None:
     bot = HokidrawBot(dry_run=dry_run)
     await bot.startup()
 
     scheduler = AsyncIOScheduler(timezone="Asia/Jakarta")
-
     scheduler.add_job(
         bot.hourly_cycle,
         CronTrigger(minute=POLL_START_MINUTE, timezone="Asia/Jakarta"),
@@ -818,39 +408,14 @@ async def run(dry_run: bool) -> None:
         coalesce=True,
         misfire_grace_time=120,
     )
-
     scheduler.add_job(
         bot.daily_summary,
         CronTrigger(hour=23, minute=55, timezone="Asia/Jakarta"),
         id="daily_summary",
         max_instances=1,
     )
-
-    scheduler.add_job(
-        bot.refresh_snapshot,
-        "interval",
-        seconds=FLEET_SNAPSHOT_REFRESH_SECONDS,
-        id="refresh_snapshot",
-        max_instances=1,
-        coalesce=True,
-        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=30),
-    )
-
-    scheduler.add_job(
-        bot.process_manual_commands,
-        "interval",
-        seconds=FLEET_COMMAND_POLL_SECONDS,
-        id="process_manual_commands",
-        max_instances=1,
-        coalesce=True,
-        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=5),
-    )
-
     scheduler.start()
-    logger.info(
-        "Scheduler aktif. Siklus setiap jam di menit :%02d. Dry run: %s",
-        POLL_START_MINUTE, dry_run,
-    )
+    logger.info("Scheduler aktif. Siklus setiap jam di menit :%02d. Dry run: %s", POLL_START_MINUTE, dry_run)
 
     try:
         while True:
@@ -862,24 +427,17 @@ async def run(dry_run: bool) -> None:
         await bot.shutdown()
 
 
-# ─── Entry point ─────────────────────────────────────────────────────────────
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Hokidraw 2D Auto-Betting Bot")
-    parser.add_argument("--dry-run",      action="store_true",
-                        help="Test tanpa bet sungguhan")
-    parser.add_argument("--check-config", action="store_true",
-                        help="Cek konfigurasi .env saja lalu keluar")
+    parser = argparse.ArgumentParser(description="Hokidraw single-bot multi-position bot")
+    parser.add_argument("--dry-run", action="store_true", help="Test tanpa bet sungguhan")
+    parser.add_argument("--check-config", action="store_true", help="Cek konfigurasi .env saja lalu keluar")
     args = parser.parse_args()
 
     validate_config(exit_on_error=not args.check_config)
-
     if args.check_config:
         sys.exit(0)
-
     if args.dry_run:
         logger.info("*** DRY RUN MODE — tidak ada bet sungguhan ***")
-
     asyncio.run(run(dry_run=args.dry_run))
 
 
