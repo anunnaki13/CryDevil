@@ -383,6 +383,49 @@ async def get_prediction_feedback(limit: int = 30) -> list[dict]:
             return [dict(row) for row in await cur.fetchall()]
 
 
+async def get_prediction_diagnostics(
+    recent_periods: int = 20,
+    low_conf_cutoff: float = 0.60,
+    source: str = "auto",
+) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            WITH recent_period_list AS (
+                SELECT period
+                FROM prediction_runs
+                WHERE source = ? AND is_correct IS NOT NULL
+                GROUP BY period
+                ORDER BY MAX(id) DESC
+                LIMIT ?
+            ),
+            recent_runs AS (
+                SELECT *
+                FROM prediction_runs
+                WHERE source = ?
+                  AND is_correct IS NOT NULL
+                  AND period IN (SELECT period FROM recent_period_list)
+            )
+            SELECT slot,
+                   COUNT(*) AS total,
+                   COALESCE(SUM(is_correct), 0) AS wins,
+                   AVG(confidence) AS avg_confidence,
+                   SUM(CASE WHEN selected_for_bet = 1 THEN 1 ELSE 0 END) AS picked_total,
+                   SUM(CASE WHEN selected_for_bet = 1 AND is_correct = 1 THEN 1 ELSE 0 END) AS picked_wins,
+                   SUM(CASE WHEN selected_for_bet = 0 THEN 1 ELSE 0 END) AS skipped_total,
+                   SUM(CASE WHEN selected_for_bet = 0 AND is_correct = 1 THEN 1 ELSE 0 END) AS skipped_wins,
+                   SUM(CASE WHEN confidence < ? THEN 1 ELSE 0 END) AS low_conf_total,
+                   SUM(CASE WHEN confidence < ? AND is_correct = 1 THEN 1 ELSE 0 END) AS low_conf_wins
+            FROM recent_runs
+            GROUP BY slot
+            ORDER BY slot ASC
+            """,
+            (source, recent_periods, source, low_conf_cutoff, low_conf_cutoff),
+        ) as cur:
+            return [dict(row) for row in await cur.fetchall()]
+
+
 async def save_knowledge_base_snapshot(
     *,
     source_count: int,

@@ -78,7 +78,10 @@ HISTORY_WINDOW = 200
 BACKLOG_RECOVERY_LIMIT = _int("BACKLOG_RECOVERY_LIMIT", 1000)
 HISTORY_FETCH_MAX_PAGES = _int("HISTORY_FETCH_MAX_PAGES", 100)
 PREDICTION_EVAL_WINDOW = _int("PREDICTION_EVAL_WINDOW", 30)
-KNOWLEDGE_BASE_HISTORY_LIMIT = _int("KNOWLEDGE_BASE_HISTORY_LIMIT", 400)
+KNOWLEDGE_BASE_HISTORY_LIMIT = _int("KNOWLEDGE_BASE_HISTORY_LIMIT", 50)
+ADAPTIVE_SELECTION_WINDOW = _int("ADAPTIVE_SELECTION_WINDOW", 20)
+LOW_CONFIDENCE_CUTOFF = _float("LOW_CONFIDENCE_CUTOFF", 0.60)
+AUTO_RELEARN_LOSS_STREAK = _int("AUTO_RELEARN_LOSS_STREAK", 4)
 
 
 BASE_BET = _int("BASE_BET", 100)
@@ -88,6 +91,12 @@ BET_TYPE = "B"
 BET_MODE = "single"
 MIN_CONFIDENCE_TO_BET = _float("MIN_CONFIDENCE_TO_BET", 0.60)
 DEFAULT_OPERATION_MODE = _optional("OPERATION_MODE", "sedang").lower()
+STRATEGY_THRESHOLD_AUTO = _float("STRATEGY_THRESHOLD_AUTO", -1.0)
+STRATEGY_THRESHOLD_ZIGZAG = _float("STRATEGY_THRESHOLD_ZIGZAG", -1.0)
+STRATEGY_THRESHOLD_TREND = _float("STRATEGY_THRESHOLD_TREND", -1.0)
+STRATEGY_THRESHOLD_HEURISTIC = _float("STRATEGY_THRESHOLD_HEURISTIC", -1.0)
+STRATEGY_THRESHOLD_LLM = _float("STRATEGY_THRESHOLD_LLM", -1.0)
+STRATEGY_THRESHOLD_HYBRID = _float("STRATEGY_THRESHOLD_HYBRID", -1.0)
 
 
 POSITIONS = ("depan", "tengah", "belakang")
@@ -142,6 +151,30 @@ def get_operation_profile(mode: str | None = None) -> dict:
         "threshold": float(profile["threshold"]),
         "martingale_levels": list(profile["martingale_levels"]),
     }
+
+
+def get_strategy_threshold(strategy: str | None, base_threshold: float) -> float:
+    normalized = (strategy or "auto").strip().lower()
+    defaults = {
+        "auto": max(0.58, min(0.82, base_threshold)),
+        "zigzag": max(0.56, min(0.80, base_threshold - 0.04)),
+        "trend": max(0.58, min(0.82, base_threshold - 0.02)),
+        "heuristic": max(0.58, min(0.82, base_threshold - 0.01)),
+        "llm": max(0.60, min(0.84, base_threshold)),
+        "hybrid": max(0.59, min(0.84, base_threshold - 0.01)),
+    }
+    configured = {
+        "auto": STRATEGY_THRESHOLD_AUTO,
+        "zigzag": STRATEGY_THRESHOLD_ZIGZAG,
+        "trend": STRATEGY_THRESHOLD_TREND,
+        "heuristic": STRATEGY_THRESHOLD_HEURISTIC,
+        "llm": STRATEGY_THRESHOLD_LLM,
+        "hybrid": STRATEGY_THRESHOLD_HYBRID,
+    }
+    explicit = configured.get(normalized, -1.0)
+    if 0.0 <= explicit <= 1.0:
+        return explicit
+    return defaults.get(normalized, base_threshold)
 
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()

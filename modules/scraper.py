@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 class Scraper:
     def __init__(self, auth: AuthManager) -> None:
         self._auth = auth
+        self._last_period_status: str = "unknown"
 
     async def _client(self) -> httpx.AsyncClient:
         return await self._auth.get_client()
@@ -70,6 +71,7 @@ class Scraper:
         """Parse current betting periode dari load endpoint, lalu fallback ke game page/history."""
         client = await self._client()
         saw_closed_marker = False
+        self._last_period_status = "unknown"
 
         for game_name in (GAME_TYPE, "4d"):
             try:
@@ -81,6 +83,7 @@ class Scraper:
                     saw_closed_marker = True
                 period = self._extract_periode(resp.text)
                 if period:
+                    self._last_period_status = "open"
                     return period
             except Exception as e:
                 logger.debug("Period fetch from load/%s failed: %s", game_name, e)
@@ -94,11 +97,13 @@ class Scraper:
                 saw_closed_marker = True
             period = self._extract_periode(resp.text)
             if period:
+                self._last_period_status = "open"
                 return period
         except Exception as e:
             logger.error("Period fetch from game page failed: %s", e)
 
         if saw_closed_marker:
+            self._last_period_status = "bet_close"
             logger.info("Periode aktif tidak tersedia karena market sedang BET CLOSE")
             return None
 
@@ -109,11 +114,16 @@ class Scraper:
                 last_period = history[0]["periode"]
                 # Periode is numeric and increments by 1
                 next_period = str(int(last_period) + 1)
+                self._last_period_status = "derived_from_history"
                 logger.info("Derived current periode from history: %s (last=%s)", next_period, last_period)
                 return next_period
         except Exception as e:
             logger.error("Period derivation from history failed: %s", e)
+        self._last_period_status = "unavailable"
         return None
+
+    def get_last_period_status(self) -> str:
+        return self._last_period_status
 
     @staticmethod
     def _extract_periode(html: str) -> Optional[str]:
