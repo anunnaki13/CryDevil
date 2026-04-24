@@ -58,6 +58,11 @@ class TelegramNotifier:
         dimension: str,
         choice: str,
         confidence: float,
+        score: float,
+        selected_reason: str,
+        strategy_mode: str,
+        selected_method: str,
+        threshold: float,
         amount: int,
         level: int,
         ranking: list[dict],
@@ -67,14 +72,21 @@ class TelegramNotifier:
         mode = "[DRY RUN] " if dry_run else ""
         top_lines = []
         for item in ranking[:6]:
+            item_score = float(item.get("score", item["confidence"]))
             top_lines.append(
-                f"{format_slot(item['slot'])}={CHOICE_LABELS.get(item['choice'], item['choice'])} @{float(item['confidence']):.0%}"
+                f"{format_slot(item['slot'])}={CHOICE_LABELS.get(item['choice'], item['choice'])} "
+                f"C{float(item['confidence']):.0%}/S{item_score:.0%}"
             )
+        reason_short = (selected_reason or "-").replace(" | ", " / ")
+        if len(reason_short) > 180:
+            reason_short = reason_short[:177] + "..."
         text = (
             f"{mode}🎯 {self._title(f'BET Periode {periode}')}\n"
             f"Pilihan: <b>{POSITION_LABELS.get(target_position, target_position)} "
             f"{DIMENSION_LABELS.get(dimension, dimension)} {CHOICE_LABELS.get(choice, choice)}</b>\n"
-            f"Confidence: {confidence:.0%} | Level: {level}\n"
+            f"Strategy: {str(strategy_mode).upper()} | Method: {str(selected_method).upper()}\n"
+            f"Confidence: {confidence:.0%} | Score: {score:.0%} | Threshold: {threshold:.0%} | Level: {level}\n"
+            f"Alasan: {reason_short}\n"
             f"Modal: {self._idr(amount * 50)}\n"
             f"Ranking: {' | '.join(top_lines)}"
         )

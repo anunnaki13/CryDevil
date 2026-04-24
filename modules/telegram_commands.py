@@ -5,10 +5,11 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Optional
 
-from telegram import BotCommand, Update
+from telegram import BotCommand, BotCommandScopeChat, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from config import (
+    AUTO_RELEARN_LOSS_STREAK,
     DEFAULT_OPERATION_MODE,
     DB_PATH,
     INSTANCE_LABEL,
@@ -21,6 +22,7 @@ from config import (
     TELEGRAM_COMMANDS_ENABLED,
     TELEGRAM_PREDICT_COOLDOWN_SECONDS,
     get_operation_profile,
+    get_strategy_threshold,
     normalize_operation_mode,
 )
 from modules import database as db
@@ -60,6 +62,63 @@ def _choice_label(choice: str) -> str:
     return CHOICE_LABELS.get(choice, choice)
 
 
+def _normalize_scope(value: str | None) -> str:
+    normalized = (value or "all").strip().lower()
+    return normalized if normalized in ("all", *POSITIONS) else "all"
+
+
+def _normalize_strategy_mode(value: str | None) -> str:
+    normalized = (value or "auto").strip().lower()
+    return normalized if normalized in ("auto", "zigzag", "trend", "heuristic", "llm", "hybrid") else "auto"
+
+
+def _strategy_label(value: str | None) -> str:
+    labels = {
+        "auto": "AUTO",
+        "zigzag": "ZIGZAG",
+        "trend": "TREND",
+        "heuristic": "HEURISTIC",
+        "llm": "LLM",
+        "hybrid": "HYBRID",
+    }
+    return labels.get(_normalize_strategy_mode(value), "AUTO")
+
+
+def _extract_scope_from_source(source: str | None) -> str:
+    raw = str(source or "").strip().lower()
+    for scope in (*POSITIONS, "all"):
+        if raw.endswith(f"_scope_{scope}"):
+            return scope
+    return "all"
+
+
+def _format_kb_operational_lines(knowledge: dict | None, scope: str) -> list[str]:
+    if not isinstance(knowledge, dict):
+        return []
+    positions = knowledge.get("positions")
+    if not isinstance(positions, dict):
+        return []
+
+    active_positions = [scope] if scope in POSITIONS else list(POSITIONS)
+    lines: list[str] = []
+    for target in active_positions:
+        item = positions.get(target)
+        if not isinstance(item, dict):
+            continue
+        bk = item.get("besar_kecil", {}) if isinstance(item.get("besar_kecil"), dict) else {}
+        gj = item.get("genap_ganjil", {}) if isinstance(item.get("genap_ganjil"), dict) else {}
+        lines.append(
+            f"{POSITION_LABELS.get(target, target)}: "
+            f"BK {bk.get('bias', 'NETRAL')}/{bk.get('strength', 'lemah')} | "
+            f"GJ {gj.get('bias', 'NETRAL')}/{gj.get('strength', 'lemah')}"
+        )
+        note_parts = [str(bk.get("note", "")).strip(), str(gj.get("note", "")).strip()]
+        note = " | ".join(part for part in note_parts if part)
+        if note:
+            lines.append(note[:220])
+    return lines
+
+
 class TelegramCommands:
     def __init__(
         self,
@@ -88,6 +147,12 @@ class TelegramCommands:
     def _is_authorized(self, update: Update) -> bool:
         return str(update.effective_chat.id) == str(TELEGRAM_CHAT_ID)
 
+    async def _get_analysis_scope(self) -> str:
+        return _normalize_scope(await db.get_state("analysis_scope", "all"))
+
+    async def _get_strategy_mode(self) -> str:
+        return _normalize_strategy_mode(await db.get_state("strategy_mode", "auto"))
+
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update):
             return
@@ -103,7 +168,10 @@ class TelegramCommands:
             "/signal   — Snapshot prediksi terakhir\n"
             "/predict  — Analisis manual tanpa pasang bet\n"
             "/kb       — Status knowledge base aktif\n"
-            "/kbbuild  — Build knowledge base dari 400 history\n"
+            f"/kbbuild  — Build knowledge base dari {KNOWLEDGE_BASE_HISTORY_LIMIT} history\n"
+            "/scope    — Lihat/ganti scope analisa posisi\n"
+            "/strategy — Lihat/ganti metode prediksi\n"
+            "/relearnstatus — Status auto relearn loss streak\n"
             "/mode     — Lihat/ganti mode aman-sedang-agresif\n"
             "/betnow   — Pasang bet sekarang untuk periode aktif\n"
             "/pause    — Pause bot\n"
@@ -118,8 +186,14 @@ class TelegramCommands:
         summary = await self._mm.get_status_summary()
         balance = await self._auth.get_balance()
         last_period = await db.get_state("last_period", "-")
+        scope = await self._get_analysis_scope()
+        strategy = await self._get_strategy_mode()
+        strategy_threshold = get_strategy_threshold(strategy, float(summary["threshold"]))
         pause_str = "PAUSED" if self._paused else "AKTIF"
         mode_label = summary.get("mode_label", "SEDANG")
+        global_loss_streak = int(await db.get_state("global_consecutive_losses", "0"))
+        last_relearn_period = await db.get_state("last_auto_relearn_period", "-")
+        last_relearn_streak = await db.get_state("last_auto_relearn_at_streak", "-")
         top_slots = sorted(summary["slots"].items(), key=lambda item: (-item[1]["level"], item[0]))[:6]
         slot_lines = [
             f"{format_slot(slot)}: Lv{info['level']} | {_idr(info['bet'])}/angka | loss {info['losses']}"
@@ -129,11 +203,17 @@ class TelegramCommands:
             f"<b>Status Bot {INSTANCE_LABEL}</b>\n\n"
             f"Status    : {pause_str}\n"
             f"Mode      : {mode_label}\n"
+            f"Scope     : {scope.upper()}\n"
+            f"Strategy  : {_strategy_label(strategy)}\n"
             f"Saldo     : {_idr(balance)}\n"
-            f"Strategi  : 1 bet terbaik dari 6 kandidat\n"
+            f"Seleksi   : 1 bet terbaik dari kandidat scope aktif\n"
             f"LLM       : {LLM_PRIMARY}\n"
-            f"Threshold : {float(summary['threshold']):.0%}\n"
+            f"Threshold : {float(strategy_threshold):.0%}\n"
             f"Periode terakhir: {last_period}\n\n"
+            f"<b>Auto Relearn</b>\n"
+            f"Trigger    : {AUTO_RELEARN_LOSS_STREAK} loss beruntun\n"
+            f"Streak kini: {global_loss_streak}\n"
+            f"Trigger terakhir: P{last_relearn_period} @ streak {last_relearn_streak}\n\n"
             f"<b>Martingale</b>\n" + "\n".join(slot_lines) + "\n\n"
             f"<b>Limit Harian</b>\n"
             f"Rugi hari ini : {_idr(summary['daily_loss'])} / {_idr(summary['daily_limit'])}\n"
@@ -142,8 +222,119 @@ class TelegramCommands:
         )
         await update.message.reply_text(text, parse_mode="HTML")
 
+    async def _cmd_relearnstatus(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update):
+            return
+        kb = await db.get_active_knowledge_base()
+        global_loss_streak = int(await db.get_state("global_consecutive_losses", "0"))
+        last_period = await db.get_state("last_auto_relearn_period", "-")
+        last_streak = await db.get_state("last_auto_relearn_at_streak", "-")
+        sisa = max(0, AUTO_RELEARN_LOSS_STREAK - global_loss_streak) if AUTO_RELEARN_LOSS_STREAK > 0 else 0
+
+        lines = [
+            "<b>Auto Relearn Status</b>\n",
+            f"Trigger streak : {AUTO_RELEARN_LOSS_STREAK}",
+            f"Streak saat ini: {global_loss_streak}",
+            f"Sisa ke trigger: {sisa}",
+            f"Last trigger   : P{last_period} @ streak {last_streak}",
+            f"KB window      : {KNOWLEDGE_BASE_HISTORY_LIMIT} history",
+        ]
+        if kb:
+            lines.extend([
+                "",
+                "<b>KB Aktif</b>",
+                f"Dataset : {kb['source_count']}",
+                f"Periode : {kb['period_from']} -> {kb['period_to']}",
+                f"Sumber  : {kb['source']}",
+                f"Dibuat  : {kb['created_at']}",
+            ])
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def _cmd_scope(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update):
+            return
+
+        current = await self._get_analysis_scope()
+        if not context.args:
+            lines = [
+                "<b>Scope Analisa</b>\n",
+                f"Aktif: <b>{current.upper()}</b>",
+                "",
+                "Pilihan:",
+                "/scope all",
+                "/scope depan",
+                "/scope tengah",
+                "/scope belakang",
+            ]
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+            return
+
+        requested = _normalize_scope(context.args[0])
+        if context.args[0].strip().lower() not in ("all", *POSITIONS):
+            await update.message.reply_text("Scope tidak valid. Gunakan: /scope all | depan | tengah | belakang")
+            return
+
+        await db.set_state("analysis_scope", requested)
+        await update.message.reply_text(
+            f"Scope analisa diubah ke <b>{requested.upper()}</b>. "
+            "Prediksi dan bet berikutnya hanya memakai scope ini.",
+            parse_mode="HTML",
+        )
+
+    async def _cmd_strategy(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_authorized(update):
+            return
+
+        current = await self._get_strategy_mode()
+        base_threshold = float((await self._mm.get_status_summary())["threshold"])
+        if not context.args:
+            lines = [
+                "<b>Metode Prediksi</b>\n",
+                f"Aktif: <b>{_strategy_label(current)}</b>",
+                "",
+                "Pilihan:",
+                "/strategy auto",
+                "/strategy zigzag",
+                "/strategy trend",
+                "/strategy heuristic",
+                "/strategy llm",
+                "/strategy hybrid",
+                "",
+                "Threshold:",
+                f"AUTO {get_strategy_threshold('auto', base_threshold):.0%} | "
+                f"ZIGZAG {get_strategy_threshold('zigzag', base_threshold):.0%} | "
+                f"TREND {get_strategy_threshold('trend', base_threshold):.0%}",
+                f"HEURISTIC {get_strategy_threshold('heuristic', base_threshold):.0%} | "
+                f"LLM {get_strategy_threshold('llm', base_threshold):.0%} | "
+                f"HYBRID {get_strategy_threshold('hybrid', base_threshold):.0%}",
+                "",
+                "AUTO = bandingkan semua metode lalu pilih kandidat terbaik",
+                "HYBRID = LLM + heuristic + feedback + adaptive",
+            ]
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+            return
+
+        raw = context.args[0].strip().lower()
+        if raw not in ("auto", "zigzag", "trend", "heuristic", "llm", "hybrid"):
+            await update.message.reply_text(
+                "Strategy tidak valid. Gunakan: /strategy auto | zigzag | trend | heuristic | llm | hybrid"
+            )
+            return
+
+        requested = _normalize_strategy_mode(raw)
+        await db.set_state("strategy_mode", requested)
+        await update.message.reply_text(
+            f"Metode prediksi diubah ke <b>{_strategy_label(requested)}</b>. "
+            f"Threshold aktif: <b>{get_strategy_threshold(requested, base_threshold):.0%}</b>. "
+            "Perubahan berlaku untuk analisa dan bet berikutnya.",
+            parse_mode="HTML",
+        )
+
     async def _cmd_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update):
+            return
+        if not await self._auth.ensure_logged_in():
+            await update.message.reply_text("Login gagal atau sesi expired.")
             return
         balance = await self._auth.get_balance()
         text = f"Saldo {INSTANCE_LABEL} saat ini: <b>{_idr(balance)}</b>" if balance is not None else "Gagal mengambil saldo."
@@ -299,19 +490,29 @@ class TelegramCommands:
         kb = await db.get_active_knowledge_base()
         if not kb:
             await update.message.reply_text(
-                "Belum ada knowledge base aktif. Jalankan /kbbuild untuk menarik 400 history dan membangun knowledge base."
+                f"Belum ada knowledge base aktif. Jalankan /kbbuild untuk menarik {KNOWLEDGE_BASE_HISTORY_LIMIT} history dan membangun knowledge base."
             )
             return
+        scope = _extract_scope_from_source(kb["source"])
+        knowledge = None
+        try:
+            knowledge = json.loads(kb.get("knowledge_json", "") or "{}")
+        except json.JSONDecodeError:
+            knowledge = None
+        operational_lines = _format_kb_operational_lines(knowledge, scope)
         lines = [
             "<b>Knowledge Base Aktif</b>\n",
             f"Dataset : {kb['source_count']} hasil",
             f"Periode : {kb['period_from']} -> {kb['period_to']}",
             f"Model   : {kb['model']}",
             f"Sumber  : {kb['source']}",
+            f"Scope   : {scope.upper()}",
             f"Dibuat  : {kb['created_at']}",
             "",
-            kb["summary_text"],
         ]
+        if operational_lines:
+            lines.extend(["<b>Ringkasan Operasional</b>", *operational_lines, ""])
+        lines.append(kb["summary_text"])
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def _cmd_kbbuild(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -325,8 +526,11 @@ class TelegramCommands:
             return
 
         self._kb_rebuild_lock = True
+        scope = await self._get_analysis_scope()
         await update.message.reply_text(
-            f"Memulai build knowledge base dari {KNOWLEDGE_BASE_HISTORY_LIMIT} history. Proses ini manual dan bisa makan waktu."
+            f"Memulai build knowledge base dari {KNOWLEDGE_BASE_HISTORY_LIMIT} history "
+            f"dengan scope <b>{scope.upper()}</b>. Proses ini manual dan bisa makan waktu.",
+            parse_mode="HTML",
         )
         try:
             if not await self._auth.ensure_logged_in():
@@ -338,7 +542,11 @@ class TelegramCommands:
                 await update.message.reply_text("History yang berhasil diambil terlalu sedikit untuk build knowledge base.")
                 return
 
-            kb = await self._predictor.rebuild_knowledge_base(history, source="telegram_manual")
+            kb = await self._predictor.rebuild_knowledge_base(
+                history,
+                source=f"telegram_manual_scope_{scope}",
+                scope=scope,
+            )
             if kb is None:
                 await update.message.reply_text("Build knowledge base gagal. Cek log untuk detail error LLM/parse.")
                 return
@@ -348,9 +556,13 @@ class TelegramCommands:
                 f"Dataset : {kb['source_count']} hasil",
                 f"Periode : {kb['period_from']} -> {kb['period_to']}",
                 f"Model   : {kb['model']}",
+                f"Scope   : {scope.upper()}",
                 "",
-                kb["summary_text"],
             ]
+            lines.extend(_format_kb_operational_lines(kb.get("knowledge"), scope))
+            if lines[-1] != "":
+                lines.append("")
+            lines.append(kb["summary_text"])
             await update.message.reply_text("\n".join(lines), parse_mode="HTML")
         finally:
             self._kb_rebuild_lock = False
@@ -371,16 +583,31 @@ class TelegramCommands:
         lines = [
             "<b>Signal Snapshot</b>\n",
             f"Periode  : {data.get('period', '-')}",
+            f"Scope    : {str(data.get('scope', 'all')).upper()}",
+            f"Strategy : {_strategy_label(data.get('strategy_mode', 'auto'))}",
+            f"Method   : {_strategy_label(data.get('selected_method', data.get('strategy_mode', 'auto')))}",
             f"Decision : {data.get('decision', '-')}",
             f"Selected : {format_slot(data.get('selected_slot', '-')) if data.get('selected_slot') else '-'} | "
-            f"{_choice_label(data.get('selected_choice', '-'))} | {float(data.get('selected_confidence', 0.0)):.0%}",
+            f"{_choice_label(data.get('selected_choice', '-'))} | "
+            f"C{float(data.get('selected_confidence', 0.0)):.0%}/S{float(data.get('selected_score', data.get('selected_confidence', 0.0))):.0%}",
+            f"Reason   : {str(data.get('selected_reason', '-') or '-')}",
             "",
-            "<b>Ranking</b>",
         ]
+        candidates = data.get("method_candidates") or []
+        if candidates:
+            lines.append("<b>Method Compare</b>")
+            for item in candidates[:6]:
+                lines.append(
+                    f"{_strategy_label(item.get('method'))} | {format_slot(item.get('slot', '-'))} | "
+                    f"{_choice_label(item.get('choice', '-'))} | "
+                    f"C{float(item.get('confidence', 0.0)):.0%}/S{float(item.get('score', item.get('confidence', 0.0))):.0%}"
+                )
+            lines.append("")
+        lines.append("<b>Ranking</b>")
         for item in ranking[:6]:
             lines.append(
                 f"{format_slot(item['slot'])} | {_choice_label(item['choice'])} | "
-                f"{float(item['confidence']):.0%} | {item.get('reason', '-')}"
+                f"C{float(item['confidence']):.0%}/S{float(item.get('score', item['confidence'])):.0%} | {item.get('reason', '-')}"
             )
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -416,7 +643,9 @@ class TelegramCommands:
             await update.message.reply_text("Gagal ambil periode saat ini.")
             return
 
-        prediction = await self._predictor.analyze(history)
+        scope = await self._get_analysis_scope()
+        strategy = await self._get_strategy_mode()
+        prediction = await self._predictor.analyze(history, scope=scope, strategy_mode=strategy)
         if prediction is None:
             self._last_predict_at = None
             await update.message.reply_text("Prediksi gagal.")
@@ -439,12 +668,29 @@ class TelegramCommands:
         lines = [
             "<b>Manual Predict</b>\n",
             f"Periode: {period}",
-            f"Selected: {format_slot(best['slot'])} | {_choice_label(best['choice'])} | {best['confidence']:.0%}",
+            f"Scope  : {scope.upper()}",
+            f"Strategy: {_strategy_label(strategy)}",
+            f"Method : {_strategy_label(prediction.get('selected_method', strategy))}",
+            f"Selected: {format_slot(best['slot'])} | {_choice_label(best['choice'])} | "
+            f"C{best['confidence']:.0%}/S{float(best.get('score', best['confidence'])):.0%}",
             "",
-            "<b>Ranking</b>",
         ]
+        candidates = prediction.get("method_candidates") or []
+        if candidates:
+            lines.append("<b>Method Compare</b>")
+            for item in candidates[:6]:
+                lines.append(
+                    f"{_strategy_label(item.get('method'))} | {format_slot(item.get('slot', '-'))} | "
+                    f"{_choice_label(item.get('choice', '-'))} | "
+                    f"C{float(item.get('confidence', 0.0)):.0%}/S{float(item.get('score', item.get('confidence', 0.0))):.0%}"
+                )
+            lines.append("")
+        lines.append("<b>Ranking</b>")
         for item in prediction["ranking"][:6]:
-            lines.append(f"{format_slot(item['slot'])} | {_choice_label(item['choice'])} | {item['confidence']:.0%}")
+            lines.append(
+                f"{format_slot(item['slot'])} | {_choice_label(item['choice'])} | "
+                f"C{float(item['confidence']):.0%}/S{float(item.get('score', item['confidence'])):.0%}"
+            )
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def _cmd_betnow(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -499,13 +745,18 @@ class TelegramCommands:
         self._app.add_handler(CommandHandler("predict", self._cmd_predict))
         self._app.add_handler(CommandHandler("kb", self._cmd_kb))
         self._app.add_handler(CommandHandler("kbbuild", self._cmd_kbbuild))
+        self._app.add_handler(CommandHandler("scope", self._cmd_scope))
+        self._app.add_handler(CommandHandler("strategy", self._cmd_strategy))
+        self._app.add_handler(CommandHandler("relearnstatus", self._cmd_relearnstatus))
         self._app.add_handler(CommandHandler("mode", self._cmd_mode))
         self._app.add_handler(CommandHandler("betnow", self._cmd_betnow))
         self._app.add_handler(CommandHandler("pause", self._cmd_pause))
         self._app.add_handler(CommandHandler("resume", self._cmd_resume))
 
-        await self._app.bot.set_my_commands([
+        command_list = [
             BotCommand("status", "Ringkasan status bot"),
+            BotCommand("scope", "Lihat atau ganti scope"),
+            BotCommand("strategy", "Lihat atau ganti metode"),
             BotCommand("balance", "Cek saldo bot"),
             BotCommand("history", "10 bet terakhir + net"),
             BotCommand("results", "10 hasil draw terakhir"),
@@ -515,13 +766,19 @@ class TelegramCommands:
             BotCommand("signal", "Snapshot prediksi terakhir"),
             BotCommand("predict", "Analisis manual tanpa bet"),
             BotCommand("kb", "Lihat knowledge base aktif"),
-            BotCommand("kbbuild", "Build knowledge base 400 history"),
+            BotCommand("kbbuild", f"Build knowledge base {KNOWLEDGE_BASE_HISTORY_LIMIT} history"),
+            BotCommand("relearnstatus", "Status auto relearn"),
             BotCommand("mode", "Lihat atau ganti mode"),
             BotCommand("betnow", "Bet sekarang untuk periode aktif"),
             BotCommand("pause", "Pause bot"),
             BotCommand("resume", "Resume bot"),
             BotCommand("help", "Daftar perintah"),
-        ])
+        ]
+        await self._app.bot.set_my_commands(command_list)
+        await self._app.bot.set_my_commands(
+            command_list,
+            scope=BotCommandScopeChat(chat_id=int(TELEGRAM_CHAT_ID)),
+        )
 
         paused = await db.get_state("bot_paused", "0")
         self._paused = paused == "1"

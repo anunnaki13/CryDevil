@@ -19,15 +19,19 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from config import (
+    AUTO_RELEARN_LOSS_STREAK,
     BACKLOG_RECOVERY_LIMIT,
     DAILY_LOSS_LIMIT,
     DEFAULT_OPERATION_MODE,
+    get_strategy_threshold,
     HISTORY_WINDOW,
     INSTANCE_LABEL,
+    KNOWLEDGE_BASE_HISTORY_LIMIT,
     LOG_PATH,
     MAX_POLL_ATTEMPTS,
     POLL_INTERVAL_SECONDS,
     POLL_START_MINUTE,
+    POSITIONS,
     BET_DEADLINE_MINUTE,
     validate_config,
 )
@@ -63,6 +67,16 @@ def _today_wib() -> str:
     return _now_wib().strftime("%Y-%m-%d")
 
 
+def _normalize_analysis_scope(value: str | None) -> str:
+    normalized = (value or "all").strip().lower()
+    return normalized if normalized in ("all", *POSITIONS) else "all"
+
+
+def _normalize_strategy_mode(value: str | None) -> str:
+    normalized = (value or "auto").strip().lower()
+    return normalized if normalized in ("auto", "zigzag", "trend", "heuristic", "llm", "hybrid") else "auto"
+
+
 class HokidrawBot:
     def __init__(self, dry_run: bool = False) -> None:
         self.dry_run = dry_run
@@ -82,6 +96,44 @@ class HokidrawBot:
         )
         self._last_period: Optional[str] = None
         self._cycle_lock = asyncio.Lock()
+        self._auto_relearn_lock = asyncio.Lock()
+
+    async def _sync_site_status_alert(self) -> None:
+        status = str(await db.get_state("site_status", "unknown") or "unknown")
+        notified = str(await db.get_state("site_status_notified", "") or "")
+        detail = str(await db.get_state("site_status_detail", "") or "")
+        if status == notified:
+            return
+
+        if status == "maintenance":
+            message = (
+                "Website terdeteksi <b>MAINTENANCE</b>. "
+                "Bot akan menahan aksi yang butuh login/scrape dan mencoba lagi pada siklus berikutnya."
+            )
+            if detail:
+                message += f"\nDetail: <code>{detail}</code>"
+            await self.notifier.notify_alert(message)
+        elif status == "normal" and notified in {"maintenance", "session_invalid", "degraded"}:
+            message = "Website kembali <b>ONLINE</b>. Session dan endpoint utama kembali normal."
+            if detail:
+                message += f"\nDetail terakhir: <code>{detail}</code>"
+            await self.notifier.notify_alert(message)
+        elif status in {"session_invalid", "degraded"}:
+            message = (
+                "Website/login sedang <b>tidak stabil</b>. "
+                "Bot akan retry otomatis pada siklus berikutnya."
+            )
+            if detail:
+                message += f"\nDetail: <code>{detail}</code>"
+            await self.notifier.notify_alert(message)
+
+        await db.set_state("site_status_notified", status)
+
+    async def _get_analysis_scope(self) -> str:
+        return _normalize_analysis_scope(await db.get_state("analysis_scope", "all"))
+
+    async def _get_strategy_mode(self) -> str:
+        return _normalize_strategy_mode(await db.get_state("strategy_mode", "auto"))
 
     async def _store_signal_snapshot(
         self,
@@ -99,12 +151,19 @@ class HokidrawBot:
         payload = {
             "period": period,
             "source": source,
+            "scope": prediction.get("scope", await self._get_analysis_scope()),
+            "strategy_mode": prediction.get("strategy_mode", await self._get_strategy_mode()),
+            "selected_method": prediction.get("selected_method"),
+            "method_candidates": prediction.get("method_candidates", []),
+            "active_targets": prediction.get("active_targets", list(POSITIONS)),
             "decision": decision,
             "selected_slot": selected.get("slot") if selected else None,
             "selected_target": selected.get("target") if selected else None,
             "selected_dimension": selected.get("dimension") if selected else None,
             "selected_choice": selected.get("choice") if selected else None,
             "selected_confidence": selected.get("confidence") if selected else None,
+            "selected_score": selected.get("score") if selected else None,
+            "selected_reason": selected.get("reason") if selected else None,
             "threshold": threshold,
             "positions": prediction.get("positions", {}),
             "ranking": prediction.get("ranking", []),
@@ -145,13 +204,17 @@ class HokidrawBot:
             return False, f"already_bet:{period}"
 
         profile = await self.mm.get_operation_profile()
-        threshold = float(profile["threshold"])
-        prediction = await self.predictor.analyze(history)
+        scope = await self._get_analysis_scope()
+        strategy_mode = await self._get_strategy_mode()
+        prediction = await self.predictor.analyze(history, scope=scope, strategy_mode=strategy_mode)
         if prediction is None or not prediction.get("ranking"):
-            await self.notifier.notify_alert("Prediksi gagal")
+            await self.notifier.notify_alert(f"Prediksi gagal untuk scope {scope} dengan strategy {strategy_mode}")
             return False, "prediction_failed"
 
         best = prediction["ranking"][0]
+        selected_strategy = str(prediction.get("selected_method") or strategy_mode)
+        threshold = float(get_strategy_threshold(selected_strategy, float(profile["threshold"])))
+        best_score = float(best.get("score", best["confidence"]))
         await self._store_signal_snapshot(
             period,
             prediction,
@@ -175,17 +238,17 @@ class HokidrawBot:
                 reason=item.get("reason", ""),
             )
 
-        if best["confidence"] < threshold:
+        if best_score < threshold:
             await self._store_signal_snapshot(
                 period,
                 prediction,
                 selected=best,
                 decision="SKIP",
                 source="auto",
-                note="below_threshold",
+                note="below_threshold_score",
                 threshold=threshold,
             )
-            return False, f"below_threshold:{period}"
+            return False, f"below_threshold_score:{period}"
 
         amount = await self.mm.get_bet_amount(best["slot"])
         level = await self.mm.get_level(best["slot"])
@@ -224,6 +287,11 @@ class HokidrawBot:
             dimension=best["dimension"],
             choice=best["choice"],
             confidence=best["confidence"],
+            score=float(best.get("score", best["confidence"])),
+            selected_reason=str(best.get("reason", "")),
+            strategy_mode=str(prediction.get("strategy_mode", strategy_mode)),
+            selected_method=str(prediction.get("selected_method", strategy_mode)),
+            threshold=threshold,
             amount=amount,
             level=level,
             ranking=prediction["ranking"],
@@ -239,8 +307,12 @@ class HokidrawBot:
 
         async with self._cycle_lock:
             if not await self.auth.ensure_logged_in():
-                await self.notifier.notify_alert("Login gagal — skip siklus ini")
+                await self._sync_site_status_alert()
+                site_status = str(await db.get_state("site_status", "unknown") or "unknown")
+                if site_status != "maintenance":
+                    await self.notifier.notify_alert("Login gagal — skip siklus ini")
                 return
+            await self._sync_site_status_alert()
 
             results = []
             for attempt in range(1, MAX_POLL_ATTEMPTS + 1):
@@ -269,10 +341,18 @@ class HokidrawBot:
         if self.tg_commands.is_paused:
             return "Bot sedang <b>PAUSED</b>. Gunakan /resume dulu."
         if not await self.auth.ensure_logged_in():
+            await self._sync_site_status_alert()
+            site_status = str(await db.get_state("site_status", "unknown") or "unknown")
+            if site_status == "maintenance":
+                return "Website sedang <b>MAINTENANCE</b>. Bot akan cek lagi otomatis pada siklus berikutnya."
             return "Login gagal atau sesi expired."
+        await self._sync_site_status_alert()
 
         period = await self.scraper.get_current_periode()
         if not period:
+            status = self.scraper.get_last_period_status()
+            if status == "bet_close":
+                return "Periode aktif tidak tersedia karena market sedang <b>BET CLOSE</b>."
             return "Periode aktif tidak tersedia."
         if period == self._last_period:
             return f"Periode <b>{period}</b> sudah pernah dibet."
@@ -352,6 +432,62 @@ class HokidrawBot:
                 profit=payout["net"],
                 balance=balance,
             )
+            await self._handle_auto_relearn(period=period, won=won)
+
+    async def _handle_auto_relearn(self, *, period: str, won: bool) -> None:
+        if AUTO_RELEARN_LOSS_STREAK <= 0:
+            return
+
+        if won:
+            await db.set_state("global_consecutive_losses", "0")
+            return
+
+        streak = int(await db.get_state("global_consecutive_losses", "0")) + 1
+        await db.set_state("global_consecutive_losses", str(streak))
+        if streak % AUTO_RELEARN_LOSS_STREAK != 0:
+            return
+
+        last_trigger_period = await db.get_state("last_auto_relearn_period", "")
+        if last_trigger_period == period:
+            return
+        if self._auto_relearn_lock.locked():
+            logger.info("Auto relearn dilewati: rebuild sebelumnya masih berjalan")
+            return
+
+        async with self._auto_relearn_lock:
+            logger.warning(
+                "Loss streak global mencapai %s pada periode %s — memulai auto relearn knowledge base",
+                streak,
+                period,
+            )
+            await self.notifier.notify_alert(
+                f"Loss streak mencapai {streak} kali berturut-turut. "
+                f"Memulai auto relearn knowledge base dari {KNOWLEDGE_BASE_HISTORY_LIMIT} history terbaru."
+            )
+
+            if not await self.auth.ensure_logged_in():
+                logger.error("Auto relearn dibatalkan: login/session tidak valid")
+                return
+
+            history = await self.scraper.get_draw_history(limit=KNOWLEDGE_BASE_HISTORY_LIMIT)
+            if len(history) < max(20, KNOWLEDGE_BASE_HISTORY_LIMIT):
+                logger.error("Auto relearn dibatalkan: history terlalu sedikit (%s)", len(history))
+                return
+
+            kb = await self.predictor.rebuild_knowledge_base(history, source=f"auto_loss_streak_{streak}")
+            if kb is None:
+                logger.error("Auto relearn gagal saat rebuild knowledge base")
+                await self.notifier.notify_alert(
+                    f"Auto relearn gagal setelah {streak} loss beruntun. Cek log predictor/LLM."
+                )
+                return
+
+            await db.set_state("last_auto_relearn_period", period)
+            await db.set_state("last_auto_relearn_at_streak", str(streak))
+            await self.notifier.notify_alert(
+                f"Auto relearn selesai setelah {streak} loss beruntun.\n"
+                f"KB baru: {kb['source_count']} history, periode {kb['period_from']} -> {kb['period_to']}."
+            )
 
     async def daily_summary(self) -> None:
         today = _today_wib()
@@ -372,15 +508,22 @@ class HokidrawBot:
         else:
             await self.notifier.notify_alert(f"Tidak ada bet hari ini ({today})")
         await self.mm.midnight_reset()
+        await db.set_state("global_consecutive_losses", "0")
         await db.set_state("daily_limit_notified", "0")
 
     async def startup(self) -> None:
         await db.init_db()
         if await db.get_state("operation_mode") is None:
             await db.set_state("operation_mode", DEFAULT_OPERATION_MODE)
+        if await db.get_state("analysis_scope") is None:
+            await db.set_state("analysis_scope", "all")
+        if await db.get_state("strategy_mode") is None:
+            await db.set_state("strategy_mode", "auto")
         if not await self.auth.login():
+            await self._sync_site_status_alert()
             logger.error("Login awal gagal — cek kredensial di .env")
             sys.exit(1)
+        await self._sync_site_status_alert()
         balance = await self.auth.get_balance()
         logger.info("Login OK. Balance: Rp%s", f"{balance:,}" if balance else "?")
         saved_period = await db.get_state("last_period")
